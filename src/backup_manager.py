@@ -163,6 +163,8 @@ class BackupManager:
         """
         备份单个仓库
         
+        备份完成后会立即清理本地镜像以节省磁盘空间。
+        
         Args:
             repo: 仓库信息
             
@@ -170,6 +172,7 @@ class BackupManager:
             备份结果
         """
         result = BackupResult(repository=repo, success=False)
+        mirror_created = False  # 标记是否创建了镜像，用于清理
         
         try:
             # 1. 检查仓库是否还存在
@@ -207,17 +210,20 @@ class BackupManager:
                     result.success = True
                     return result
             
-            # 4. 克隆或更新镜像
+            # 4. 克隆仓库镜像（每次都重新克隆以节省磁盘空间）
             clone_url = repo.clone_url or f"https://github.com/{repo.full_name}.git"
             has_updates, current_commit = self.git.clone_or_update_mirror(
                 repo.full_name, 
                 clone_url
             )
+            mirror_created = True  # 标记已创建镜像
             
             if not has_updates and latest_backup:
                 logger.info(f"镜像无更新，跳过: {repo.full_name}")
                 result.skipped = True
                 result.success = True
+                # 清理镜像以节省磁盘空间
+                self.git.cleanup_mirror(repo.full_name)
                 return result
             
             # 5. 创建 Bundle
@@ -280,6 +286,15 @@ class BackupManager:
             logger.error(f"备份失败 {repo.full_name}: {e}")
             result.error_message = str(e)
             await self.notifier.send_error_notification(str(e), repo)
+        
+        finally:
+            # 无论成功与否，都清理镜像以节省磁盘空间
+            if mirror_created:
+                try:
+                    self.git.cleanup_mirror(repo.full_name)
+                    logger.debug(f"已清理镜像: {repo.full_name}")
+                except Exception as cleanup_error:
+                    logger.warning(f"清理镜像失败: {cleanup_error}")
         
         return result
     
