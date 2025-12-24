@@ -223,15 +223,15 @@ class GitOperations:
         bundle_path = out_path / bundle_name
         
         try:
-            # 创建 Bundle
+            # 创建 Bundle（使用绝对路径，因为 cwd 是镜像目录）
             self._run_git_command(
-                ["bundle", "create", str(bundle_path), "--all"],
+                ["bundle", "create", str(bundle_path.resolve()), "--all"],
                 cwd=str(mirror_path)
             )
             
             # 验证 Bundle
             self._run_git_command(
-                ["bundle", "verify", str(bundle_path)],
+                ["bundle", "verify", str(bundle_path.resolve())],
                 cwd=str(mirror_path)
             )
             
@@ -306,10 +306,10 @@ class GitOperations:
         bundle_path = out_path / bundle_name
         
         try:
-            # 创建增量 Bundle
+            # 创建增量 Bundle（使用绝对路径）
             # 使用 base_commit..HEAD 的范围，并包含所有分支
             self._run_git_command(
-                ["bundle", "create", str(bundle_path), f"{base_commit}..HEAD", "--all"],
+                ["bundle", "create", str(bundle_path.resolve()), f"{base_commit}..HEAD", "--all"],
                 cwd=str(mirror_path)
             )
             
