@@ -325,7 +325,7 @@ class Database:
             full_name=row['full_name'],
             description=row['description'],
             html_url=row['html_url'],
-            clone_url=row.get('clone_url'),
+            clone_url=row['clone_url'],
             pushed_at=pushed_at,
             is_deleted=bool(row['is_deleted']),
             created_at=created_at,
