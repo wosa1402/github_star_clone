@@ -76,6 +76,10 @@ class BackupConfig(BaseModel):
     cleanup_temp: bool = Field(default=True, description="是否清理临时文件")
     max_retries: int = Field(default=3, description="最大重试次数")
     retry_delay: int = Field(default=10, description="重试间隔（秒）")
+    # 跳过仓库列表（格式：owner/repo）
+    skip_repos: list[str] = Field(default_factory=list, description="要跳过的仓库列表")
+    # 断点续传：从上次中断的位置继续
+    resume_from_last: bool = Field(default=True, description="是否从上次中断处继续")
 
 
 class AppConfig(BaseModel):

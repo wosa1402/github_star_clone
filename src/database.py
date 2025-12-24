@@ -97,6 +97,31 @@ class Database:
                 )
             """)
             
+            # 跳过仓库表（自动记录需要跳过的仓库）
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS skipped_repos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    full_name TEXT UNIQUE NOT NULL,
+                    skip_reason TEXT NOT NULL,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+            """)
+            
+            # 备份进度表（用于断点续传）
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS backup_progress (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    total_repos INTEGER,
+                    current_index INTEGER DEFAULT 0,
+                    last_repo_full_name TEXT,
+                    status TEXT DEFAULT 'running',
+                    started_at TEXT,
+                    updated_at TEXT
+                )
+            """)
+            
             # 创建索引
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_repositories_full_name 
@@ -105,6 +130,10 @@ class Database:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_backup_records_repo_id 
                 ON backup_records(repo_id)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_skipped_repos_full_name 
+                ON skipped_repos(full_name)
             """)
             
             logger.debug("数据库表初始化完成")
@@ -348,3 +377,119 @@ class Database:
             cloud_path=row['cloud_path'],
             backup_time=backup_time,
         )
+    
+    # ========== 跳过仓库操作 ==========
+    
+    def add_skipped_repo(self, full_name: str, reason: str) -> None:
+        """
+        添加跳过的仓库记录
+        
+        Args:
+            full_name: 仓库完整名称
+            reason: 跳过原因
+        """
+        now = datetime.now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO skipped_repos (full_name, skip_reason, created_at, updated_at)
+                VALUES (?, ?, COALESCE((SELECT created_at FROM skipped_repos WHERE full_name = ?), ?), ?)
+            """, (full_name, reason, full_name, now, now))
+        logger.info(f"已记录跳过仓库: {full_name}, 原因: {reason}")
+    
+    def is_repo_skipped(self, full_name: str) -> bool:
+        """检查仓库是否在跳过列表中"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM skipped_repos WHERE full_name = ?",
+                (full_name,)
+            )
+            return cursor.fetchone() is not None
+    
+    def get_skipped_repos(self) -> list[tuple[str, str]]:
+        """获取所有跳过的仓库列表，返回 (full_name, reason) 元组"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT full_name, skip_reason FROM skipped_repos")
+            return [(row['full_name'], row['skip_reason']) for row in cursor.fetchall()]
+    
+    def remove_skipped_repo(self, full_name: str) -> None:
+        """从跳过列表中移除仓库"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM skipped_repos WHERE full_name = ?", (full_name,))
+    
+    # ========== 备份进度操作 ==========
+    
+    def save_backup_progress(
+        self, 
+        session_id: str, 
+        total_repos: int, 
+        current_index: int,
+        last_repo_full_name: str,
+        status: str = "running"
+    ) -> None:
+        """
+        保存备份进度
+        
+        Args:
+            session_id: 会话 ID
+            total_repos: 总仓库数
+            current_index: 当前处理索引
+            last_repo_full_name: 最后处理的仓库名
+            status: 状态 (running/completed/failed)
+        """
+        now = datetime.now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            # 更新或插入进度记录
+            cursor.execute("""
+                INSERT OR REPLACE INTO backup_progress 
+                (id, session_id, total_repos, current_index, last_repo_full_name, status, started_at, updated_at)
+                VALUES (
+                    (SELECT id FROM backup_progress WHERE session_id = ?),
+                    ?, ?, ?, ?, ?,
+                    COALESCE((SELECT started_at FROM backup_progress WHERE session_id = ?), ?),
+                    ?
+                )
+            """, (session_id, session_id, total_repos, current_index, last_repo_full_name, status, session_id, now, now))
+    
+    def get_last_progress(self) -> Optional[dict]:
+        """
+        获取最后一次未完成的备份进度
+        
+        Returns:
+            进度信息字典或 None
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM backup_progress 
+                WHERE status = 'running'
+                ORDER BY updated_at DESC 
+                LIMIT 1
+            """)
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'session_id': row['session_id'],
+                    'total_repos': row['total_repos'],
+                    'current_index': row['current_index'],
+                    'last_repo_full_name': row['last_repo_full_name'],
+                    'status': row['status'],
+                    'started_at': row['started_at'],
+                    'updated_at': row['updated_at'],
+                }
+        return None
+    
+    def mark_progress_completed(self, session_id: str) -> None:
+        """标记备份进度为已完成"""
+        now = datetime.now().isoformat()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE backup_progress SET status = 'completed', updated_at = ? WHERE session_id = ?",
+                (now, session_id)
+            )
+

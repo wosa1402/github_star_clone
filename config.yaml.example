@@ -49,9 +49,18 @@ backup:
   #   "0 0 * * 0"     每周日凌晨
   schedule: "0 6 * * *"
   # 备份完成后是否清理临时文件（Bundle 文件）
-  # 注意：镜像目录会保留以支持增量备份
   cleanup_temp: true
   # 最大重试次数
   max_retries: 3
   # 重试间隔（秒）
   retry_delay: 10
+  
+  # 手动指定要跳过的仓库列表（格式: owner/repo）
+  # 备份过程中因磁盘空间不足失败的仓库会自动添加到数据库跳过列表
+  skip_repos:
+    # - "owner/large-repo"
+    # - "another/skip-this"
+  
+  # 是否启用断点续传（从上次中断的位置继续）
+  resume_from_last: true
+

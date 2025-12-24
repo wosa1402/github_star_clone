@@ -42,10 +42,16 @@ class BackupManager:
         """
         执行完整备份流程
         
+        支持断点续传和自动跳过配置/失败的仓库。
+        
         Returns:
             备份汇总
         """
+        import uuid
+        
         summary = BackupSummary(start_time=datetime.now())
+        session_id = str(uuid.uuid4())[:8]
+        start_index = 0
         
         try:
             # 1. 发送开始通知
@@ -60,15 +66,56 @@ class BackupManager:
             
             logger.info(f"共 {len(unique_repos)} 个唯一仓库待检查")
             
+            # 4. 检查是否有未完成的备份（断点续传）
+            if self.config.backup.resume_from_last:
+                last_progress = self.db.get_last_progress()
+                if last_progress:
+                    # 找到上次中断的位置
+                    last_repo = last_progress['last_repo_full_name']
+                    for idx, repo in enumerate(unique_repos):
+                        if repo.full_name == last_repo:
+                            start_index = idx + 1  # 从下一个开始
+                            break
+                    
+                    if start_index > 0:
+                        logger.info(f"从断点继续: 跳过前 {start_index} 个仓库，从第 {start_index + 1} 个开始")
+                        session_id = last_progress['session_id']  # 继续使用之前的 session
+            
             # 发送开始通知
+            remaining = len(unique_repos) - start_index
             await self.notifier.send_start_notification(
-                summary.total_repos, 
+                remaining, 
                 self.config.github.users
             )
             
-            # 4. 单线程顺序备份
-            for i, repo in enumerate(unique_repos, 1):
+            # 5. 获取跳过列表（配置文件 + 数据库记录）
+            skip_set = set(self.config.backup.skip_repos)
+            db_skipped = self.db.get_skipped_repos()
+            for full_name, reason in db_skipped:
+                skip_set.add(full_name)
+            
+            if skip_set:
+                logger.info(f"跳过列表中有 {len(skip_set)} 个仓库")
+            
+            # 6. 单线程顺序备份
+            for i, repo in enumerate(unique_repos[start_index:], start_index + 1):
                 logger.info(f"处理 [{i}/{summary.total_repos}]: {repo.full_name}")
+                
+                # 检查是否在跳过列表中
+                if repo.full_name in skip_set:
+                    logger.info(f"跳过仓库（在跳过列表中）: {repo.full_name}")
+                    result = BackupResult(repository=repo, success=True, skipped=True)
+                    summary.results.append(result)
+                    summary.skipped_count += 1
+                    continue
+                
+                # 保存进度
+                self.db.save_backup_progress(
+                    session_id=session_id,
+                    total_repos=summary.total_repos,
+                    current_index=i,
+                    last_repo_full_name=repo.full_name
+                )
                 
                 result = await self._backup_single_repo(repo)
                 summary.results.append(result)
@@ -82,17 +129,25 @@ class BackupManager:
                     summary.success_count += 1
                 else:
                     summary.failed_count += 1
+                    # 检查是否是磁盘空间错误，如果是则自动添加到跳过列表
+                    if result.error_message and self._is_disk_error(result.error_message):
+                        self.db.add_skipped_repo(repo.full_name, f"磁盘空间不足: {result.error_message[:100]}")
+                        await self.notifier.send_error_notification(
+                            f"仓库 {repo.full_name} 因磁盘空间不足已加入跳过列表",
+                            repo
+                        )
                 
                 # 简单的速率控制
                 await asyncio.sleep(1)
             
-            # 5. 清理临时文件
-            if self.config.backup.cleanup_temp:
-                logger.info("清理临时文件...")
-                # 只清理 bundle 文件，保留镜像以便下次增量更新
-                # self.git.cleanup_all()
+            # 7. 标记备份完成
+            self.db.mark_progress_completed(session_id)
             
-            # 6. 发送完成通知
+            # 8. 备份数据库到云端
+            logger.info("备份数据库到云端...")
+            await self.backup_database()
+            
+            # 9. 发送完成通知
             summary.end_time = datetime.now()
             await self.notifier.send_complete_notification(summary)
             
@@ -109,6 +164,20 @@ class BackupManager:
             raise
         
         return summary
+    
+    def _is_disk_error(self, error_message: str) -> bool:
+        """判断错误是否是磁盘空间不足"""
+        disk_error_keywords = [
+            "No space left on device",
+            "no space left",
+            "disk full",
+            "not enough space",
+            "磁盘空间不足",
+            "out of disk space",
+            "ENOSPC",
+        ]
+        error_lower = error_message.lower()
+        return any(kw.lower() in error_lower for kw in disk_error_keywords)
     
     async def _gather_all_stars(self) -> list[tuple[Repository, str]]:
         """
@@ -271,7 +340,10 @@ class BackupManager:
             )
             self.db.save_backup_record(record)
             
-            # 8. 清理本地 Bundle 文件
+            # 8. 上传 metadata.json（包含仓库描述等信息）
+            await self._upload_metadata(repo, bundle_result.commit_hash, cloud_path)
+            
+            # 9. 清理本地 Bundle 文件
             if self.config.backup.cleanup_temp:
                 self.git.cleanup_bundle(bundle_result.bundle_path)
             
@@ -351,3 +423,121 @@ class BackupManager:
         results['telegram'] = await self.notifier.test_connection()
         
         return results
+    
+    async def _upload_metadata(
+        self, 
+        repo: Repository, 
+        commit_hash: str,
+        bundle_cloud_path: str
+    ) -> None:
+        """
+        上传仓库元信息 metadata.json
+        
+        Args:
+            repo: 仓库信息
+            commit_hash: 当前 commit hash
+            bundle_cloud_path: Bundle 在云端的路径
+        """
+        import json
+        import tempfile
+        
+        # 获取 star 来源用户
+        star_sources = self.db.get_star_sources(repo.id) if repo.id else []
+        
+        # 构建元数据
+        metadata = {
+            "full_name": repo.full_name,
+            "owner": repo.owner,
+            "name": repo.name,
+            "description": repo.description,
+            "html_url": repo.html_url or f"https://github.com/{repo.full_name}",
+            "clone_url": repo.clone_url,
+            "pushed_at": repo.pushed_at.isoformat() if repo.pushed_at else None,
+            "is_deleted": repo.is_deleted,
+            "last_backup_commit": commit_hash,
+            "last_backup_time": datetime.now().isoformat(),
+            "last_backup_bundle": bundle_cloud_path,
+            "starred_by": star_sources,
+        }
+        
+        try:
+            # 创建临时文件
+            with tempfile.NamedTemporaryFile(
+                mode='w', 
+                suffix='.json', 
+                delete=False,
+                encoding='utf-8'
+            ) as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+                temp_path = f.name
+            
+            # 上传到 WebDAV
+            self.webdav.upload_file(
+                temp_path,
+                repo.full_name,
+                "metadata.json"
+            )
+            
+            # 清理临时文件
+            import os
+            os.unlink(temp_path)
+            
+            logger.debug(f"已上传 metadata.json: {repo.full_name}")
+            
+        except Exception as e:
+            logger.warning(f"上传 metadata.json 失败: {e}")
+            # 不影响主备份流程，仅记录警告
+    
+    async def backup_database(self) -> bool:
+        """
+        备份数据库文件到云端
+        
+        Returns:
+            是否成功
+        """
+        import shutil
+        from pathlib import Path
+        
+        db_path = Path(self.config.backup.db_path)
+        
+        if not db_path.exists():
+            logger.warning(f"数据库文件不存在: {db_path}")
+            return False
+        
+        try:
+            # 生成备份文件名
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"backup_{timestamp}.db"
+            
+            # 复制数据库文件（避免锁定问题）
+            temp_backup = db_path.parent / backup_name
+            shutil.copy2(db_path, temp_backup)
+            
+            # 上传到 WebDAV 的 _database 目录
+            cloud_path = self.webdav.upload_file(
+                str(temp_backup),
+                "_database",
+                backup_name
+            )
+            
+            # 同时上传一个 latest.db 作为最新版本
+            self.webdav.upload_file(
+                str(temp_backup),
+                "_database",
+                "latest.db"
+            )
+            
+            # 清理临时文件
+            temp_backup.unlink()
+            
+            if cloud_path:
+                logger.info(f"数据库备份成功: {cloud_path}")
+                return True
+            else:
+                logger.error("数据库上传失败")
+                return False
+                
+        except Exception as e:
+            logger.error(f"数据库备份失败: {e}")
+            return False
+
