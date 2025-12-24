@@ -1,0 +1,57 @@
+# GitHub Star 仓库备份工具配置文件示例
+
+# GitHub 配置
+github:
+  # GitHub Personal Access Token (需要 read:user 和 public_repo 权限)
+  # 获取地址: https://github.com/settings/tokens
+  token: "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  # 要备份的 GitHub 用户名列表
+  users:
+    - "example_user1"
+    - "example_user2"
+  # API 请求超时时间（秒）
+  api_timeout: 30
+
+# WebDAV 配置 (Alist)
+webdav:
+  # Alist WebDAV 地址，通常是 http://your-server:5244/dav
+  url: "http://your-alist-server:5244/dav"
+  # Alist 用户名
+  username: "admin"
+  # Alist 密码
+  password: "your_password"
+  # 备份存储的基础路径
+  base_path: "/github-backup"
+
+# Telegram 通知配置
+telegram:
+  # Telegram Bot Token (从 @BotFather 获取)
+  bot_token: "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+  # 接收通知的 Chat ID (可以是个人或群组)
+  # 发送 /start 给 @userinfobot 可以获取你的 Chat ID
+  chat_id: "987654321"
+  # 是否启用通知
+  enabled: true
+
+# 备份配置
+backup:
+  # 临时文件目录 (用于克隆仓库和生成 Bundle)
+  temp_dir: "./temp"
+  # 数据库文件路径
+  db_path: "./data/backup.db"
+  # 日志目录
+  log_dir: "./logs"
+  # 定时备份时间 (cron 表达式，默认早上 6 点)
+  # 格式: 分 时 日 月 周
+  # 示例:
+  #   "0 6 * * *"     每天早上 6 点
+  #   "0 */6 * * *"   每 6 小时
+  #   "0 0 * * 0"     每周日凌晨
+  schedule: "0 6 * * *"
+  # 备份完成后是否清理临时文件（Bundle 文件）
+  # 注意：镜像目录会保留以支持增量备份
+  cleanup_temp: true
+  # 最大重试次数
+  max_retries: 3
+  # 重试间隔（秒）
+  retry_delay: 10
