@@ -233,3 +233,42 @@ class WebDAVClient:
         files = self.list_files(remote_dir)
         # 只返回 .bundle 文件
         return [f for f in files if f.endswith('.bundle')]
+    
+    def download_file(self, remote_path: str, local_path: str) -> bool:
+        """
+        从 WebDAV 下载文件
+        
+        Args:
+            remote_path: 远程文件路径
+            local_path: 本地保存路径
+            
+        Returns:
+            是否成功
+        """
+        try:
+            # 检查远程文件是否存在
+            if not self.client.check(remote_path):
+                logger.debug(f"远程文件不存在: {remote_path}")
+                return False
+            
+            # 确保本地目录存在
+            local_file = Path(local_path)
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            
+            # 下载文件
+            logger.info(f"下载文件: {remote_path} -> {local_path}")
+            self.client.download_sync(
+                remote_path=remote_path,
+                local_path=str(local_file)
+            )
+            
+            logger.info(f"下载成功: {local_file.name}")
+            return True
+            
+        except WebDavException as e:
+            logger.error(f"下载失败: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"下载异常: {e}")
+            return False
+

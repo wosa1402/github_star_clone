@@ -22,21 +22,61 @@ from .webdav_client import WebDAVClient
 class BackupManager:
     """备份管理器"""
     
-    def __init__(self, config: AppConfig):
+    def __init__(self, config: AppConfig, auto_restore_db: bool = True):
         """
         初始化备份管理器
         
         Args:
             config: 应用配置
+            auto_restore_db: 是否自动从云端恢复数据库（默认开启）
         """
         self.config = config
         
-        # 初始化各组件
+        # 初始化 WebDAV 客户端（优先，用于恢复数据库）
+        self.webdav = WebDAVClient(config.webdav)
+        
+        # 尝试从云端恢复数据库（如果本地不存在）
+        if auto_restore_db:
+            self._try_restore_database()
+        
+        # 初始化其他组件
         self.db = Database(config.backup.db_path)
         self.github = GitHubClient(config.github)
         self.git = GitOperations(config.backup.temp_dir)
-        self.webdav = WebDAVClient(config.webdav)
         self.notifier = TelegramNotifier(config.telegram)
+    
+    def _try_restore_database(self) -> bool:
+        """
+        尝试从云端恢复数据库
+        
+        如果本地数据库不存在，则从 WebDAV 下载 latest.db
+        
+        Returns:
+            是否恢复成功
+        """
+        from pathlib import Path
+        
+        db_path = Path(self.config.backup.db_path)
+        
+        # 如果本地数据库已存在，不需要恢复
+        if db_path.exists():
+            logger.debug("本地数据库已存在，无需恢复")
+            return True
+        
+        logger.info("本地数据库不存在，尝试从云端恢复...")
+        
+        # 确保目录存在
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 尝试下载 latest.db
+        remote_path = f"{self.webdav.base_path}/_database/latest.db"
+        
+        if self.webdav.download_file(remote_path, str(db_path)):
+            logger.info("✅ 数据库恢复成功！")
+            return True
+        else:
+            logger.info("云端无数据库备份，将创建新数据库")
+            return False
     
     async def run_backup(self) -> BackupSummary:
         """

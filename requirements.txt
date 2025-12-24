@@ -19,3 +19,18 @@ python-telegram-bot>=21.0
 
 # 日志
 loguru>=0.7.0
+python3 -c "
+from src.database import Database
+from datetime import datetime
+db = Database('./data/backup.db')
+# 设置断点：填入你最后成功备份的仓库名
+last_repo = 'Zhalslar/astrbot_plugin_apis'  # ← 改成你最后成功的仓库
+db.save_backup_progress(
+    session_id='manual-resume',
+    total_repos=747,  # 你的总仓库数
+    current_index=205,  # 已完成的数量（大概值即可）
+    last_repo_full_name=last_repo,
+    status='running'
+)
+print(f'断点已设置: {last_repo}')
+"
