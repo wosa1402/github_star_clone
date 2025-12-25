@@ -434,6 +434,15 @@ class BackupManager:
                 result.success = True
                 return result
             
+            # 强制同步缓存到网络（确保数据完全写入）
+            logger.info("正在同步数据到网络...")
+            import subprocess
+            subprocess.run(["sync"], check=False)
+            
+            # 等待同步完成（给 rclone 足够时间刷新缓存）
+            await asyncio.sleep(10)
+            logger.debug("数据同步完成")
+            
             # 记录备份
             record = BackupRecord(
                 repo_id=repo.id,
