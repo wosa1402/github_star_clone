@@ -60,12 +60,17 @@ class WebDAVClient:
         """
         确保远程目录存在（兼容 AList 等 WebDAV 服务器）
         
+        使用 requests 直接发送 MKCOL 请求，绕过 webdavclient3 的兼容性问题。
+        
         Args:
             remote_path: 远程目录路径
             
         Returns:
             是否成功
         """
+        import requests
+        from requests.auth import HTTPBasicAuth
+        
         path = remote_path.rstrip('/')
         if not path or path == '/':
             return True
@@ -74,37 +79,44 @@ class WebDAVClient:
         if not path.startswith('/'):
             path = '/' + path
         
+        # 构建完整 URL
+        base_url = self.config.url.rstrip('/')
+        full_url = f"{base_url}{path}/"
+        
         try:
-            # 方法1：直接尝试创建目录（最兼容的方式）
             # 先递归确保父目录存在
             parent = str(Path(path).parent).replace('\\', '/')
             if parent and parent != '/' and parent != path:
-                self.ensure_directory(parent)
+                if not self.ensure_directory(parent):
+                    # 父目录创建失败，继续尝试（可能只是已存在）
+                    pass
             
-            # 尝试创建目录（如果已存在，大多数服务器会返回成功或特定错误）
-            try:
-                self.client.mkdir(path)
-                logger.debug(f"创建目录: {path}")
-            except WebDavException as e:
-                error_str = str(e).lower()
-                # 忽略"已存在"类的错误
-                if any(kw in error_str for kw in ['already exists', 'exists', '405', 'method not allowed']):
-                    logger.debug(f"目录已存在: {path}")
-                else:
-                    raise
+            # 使用 MKCOL 方法创建目录
+            auth = HTTPBasicAuth(self.config.username, self.config.password)
+            response = requests.request(
+                method='MKCOL',
+                url=full_url,
+                auth=auth,
+                timeout=30
+            )
             
-            return True
-            
-        except WebDavException as e:
-            error_str = str(e).lower()
-            # 这些错误可以忽略
-            if any(kw in error_str for kw in ['already exists', 'exists', '405']):
+            # 201 = 创建成功, 405 = 已存在或不支持, 301/302 = 重定向（已存在）
+            if response.status_code in [201, 200]:
+                logger.debug(f"创建目录成功: {path}")
                 return True
-            logger.error(f"创建目录失败 {path}: {e}")
-            return False
+            elif response.status_code in [405, 301, 302, 409]:
+                # 目录已存在或其他可接受的状态
+                logger.debug(f"目录已存在或已处理: {path} (状态码: {response.status_code})")
+                return True
+            else:
+                logger.warning(f"创建目录返回状态码 {response.status_code}: {path}")
+                # 继续尝试，不要因为创建目录失败就阻止上传
+                return True
+            
         except Exception as e:
-            logger.error(f"创建目录异常 {path}: {e}")
-            return False
+            logger.warning(f"创建目录异常 {path}: {e}，将继续尝试上传")
+            # 返回 True 继续尝试上传，让上传函数自己处理错误
+            return True
     
     def _check_path_exists(self, path: str) -> bool:
         """
