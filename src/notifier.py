@@ -165,24 +165,41 @@ class TelegramNotifier:
         self, 
         current: int, 
         total: int, 
-        repo_name: str
+        repo_name: str,
+        success_count: int = 0,
+        skipped_count: int = 0,
+        failed_count: int = 0,
+        status: str = "成功"
     ) -> bool:
         """
-        发送进度通知（可选，用于长时间备份时）
+        发送进度通知
         
         Args:
             current: 当前进度
             total: 总数
             repo_name: 当前仓库名
+            success_count: 成功数
+            skipped_count: 跳过数
+            failed_count: 失败数
+            status: 当前仓库状态
             
         Returns:
             是否发送成功
         """
         progress = (current / total) * 100 if total > 0 else 0
+        remaining = total - current
+        
+        # 状态图标
+        status_icon = "✅" if status == "成功" else ("⏭️" if status == "跳过" else "❌")
+        
         message = (
-            "📊 <b>备份进度</b>\n\n"
-            f"进度: {current}/{total} ({progress:.1f}%)\n"
-            f"当前: {repo_name}"
+            f"📊 <b>备份进度 [{current}/{total}]</b>\n\n"
+            f"{status_icon} <code>{repo_name}</code>\n"
+            f"状态: {status}\n\n"
+            f"📈 进度: {progress:.1f}%\n"
+            f"✅ 成功: {success_count} | ⏭️ 跳过: {skipped_count} | ❌ 失败: {failed_count}\n"
+            f"📦 剩余: {remaining} 个\n"
+            f"⏰ 时间: {self._get_current_time()}"
         )
         return await self._send_message(message)
     

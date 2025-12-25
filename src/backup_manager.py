@@ -138,7 +138,14 @@ class BackupManager:
                 logger.info(f"跳过列表中有 {len(skip_set)} 个仓库")
             
             # 6. 单线程顺序备份
+            storage_full = False  # 标记存储空间是否已满
+            
             for i, repo in enumerate(unique_repos[start_index:], start_index + 1):
+                # 检查存储空间是否已满
+                if storage_full:
+                    logger.warning("存储空间已满，停止备份")
+                    break
+                
                 logger.info(f"处理 [{i}/{summary.total_repos}]: {repo.full_name}")
                 
                 # 检查是否在跳过列表中
@@ -160,34 +167,60 @@ class BackupManager:
                 result = await self._backup_single_repo(repo)
                 summary.results.append(result)
                 
-                # 更新统计
+                # 更新统计和状态
+                status = "成功"
                 if result.is_deleted:
                     summary.deleted_count += 1
+                    status = "已删除"
                 elif result.skipped:
                     summary.skipped_count += 1
+                    status = "跳过"
                 elif result.success:
                     summary.success_count += 1
+                    status = "成功"
                 else:
                     summary.failed_count += 1
-                    # 检查是否是磁盘空间错误，如果是则自动添加到跳过列表
-                    if result.error_message and self._is_disk_error(result.error_message):
-                        self.db.add_skipped_repo(repo.full_name, f"磁盘空间不足: {result.error_message[:100]}")
-                        await self.notifier.send_error_notification(
-                            f"仓库 {repo.full_name} 因磁盘空间不足已加入跳过列表",
-                            repo
-                        )
+                    status = "失败"
+                    
+                    # 检查是否是存储空间错误
+                    if result.error_message:
+                        if self._is_disk_error(result.error_message):
+                            self.db.add_skipped_repo(repo.full_name, f"磁盘空间不足: {result.error_message[:100]}")
+                        if self._is_storage_full_error(result.error_message):
+                            storage_full = True
+                            await self.notifier.send_error_notification(
+                                "⚠️ WebDAV 存储空间已满，备份已停止！",
+                                repo
+                            )
                 
-                # 简单的速率控制
-                await asyncio.sleep(1)
+                # 发送进度通知（每个仓库完成后）
+                await self.notifier.send_progress_notification(
+                    current=i,
+                    total=summary.total_repos,
+                    repo_name=repo.full_name,
+                    success_count=summary.success_count,
+                    skipped_count=summary.skipped_count,
+                    failed_count=summary.failed_count,
+                    status=status
+                )
+                
+                # 等待 60 秒后再开始下一个仓库（避免过度占用资源）
+                if i < summary.total_repos and not storage_full:
+                    logger.info("等待 60 秒后开始下一个仓库...")
+                    await asyncio.sleep(60)
             
-            # 7. 标记备份完成
+            # 7. 生成仓库描述索引文件
+            logger.info("生成仓库描述索引文件...")
+            await self._generate_repository_index()
+            
+            # 8. 标记备份完成
             self.db.mark_progress_completed(session_id)
             
-            # 8. 备份数据库到云端
+            # 9. 备份数据库到云端
             logger.info("备份数据库到云端...")
             await self.backup_database()
             
-            # 9. 发送完成通知
+            # 10. 发送完成通知
             summary.end_time = datetime.now()
             await self.notifier.send_complete_notification(summary)
             
@@ -206,7 +239,7 @@ class BackupManager:
         return summary
     
     def _is_disk_error(self, error_message: str) -> bool:
-        """判断错误是否是磁盘空间不足"""
+        """判断错误是否是本地磁盘空间不足"""
         disk_error_keywords = [
             "No space left on device",
             "no space left",
@@ -218,6 +251,21 @@ class BackupManager:
         ]
         error_lower = error_message.lower()
         return any(kw.lower() in error_lower for kw in disk_error_keywords)
+    
+    def _is_storage_full_error(self, error_message: str) -> bool:
+        """判断错误是否是 WebDAV 存储空间不足"""
+        storage_error_keywords = [
+            "insufficient storage",
+            "quota exceeded",
+            "507",  # HTTP 507 Insufficient Storage
+            "storage full",
+            "no space",
+            "disk quota",
+            "存储空间不足",
+            "容量已满",
+        ]
+        error_lower = error_message.lower()
+        return any(kw.lower() in error_lower for kw in storage_error_keywords)
     
     async def _gather_all_stars(self) -> list[tuple[Repository, str]]:
         """
@@ -580,4 +628,140 @@ class BackupManager:
         except Exception as e:
             logger.error(f"数据库备份失败: {e}")
             return False
+    
+    async def _generate_repository_index(self) -> bool:
+        """
+        生成仓库描述索引文件，用于 AI 检索
+        
+        生成一个包含所有已备份仓库信息的 Markdown 文件，
+        方便用户发送给 AI 来查找合适的工具。
+        
+        Returns:
+            是否成功
+        """
+        import json
+        import tempfile
+        
+        try:
+            # 获取所有仓库
+            repos = self.db.get_all_repositories()
+            
+            if not repos:
+                logger.info("没有仓库记录，跳过索引生成")
+                return True
+            
+            # 生成 Markdown 格式的索引
+            lines = [
+                "# GitHub Star 仓库索引",
+                "",
+                f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"总仓库数: {len(repos)}",
+                "",
+                "## 使用说明",
+                "",
+                "这是你备份的 GitHub Star 仓库列表，包含仓库名称和描述。",
+                "你可以将此文件发送给 AI，帮助你找到适合某个需求的仓库。",
+                "",
+                "---",
+                "",
+            ]
+            
+            # 按仓库名称排序
+            sorted_repos = sorted(repos, key=lambda r: r.full_name.lower())
+            
+            for repo in sorted_repos:
+                # 跳过已删除的仓库
+                if repo.is_deleted:
+                    continue
+                
+                desc = repo.description or "无描述"
+                # 清理描述中的特殊字符
+                desc = desc.replace("\n", " ").replace("\r", " ").strip()
+                
+                lines.append(f"### {repo.full_name}")
+                lines.append("")
+                lines.append(f"- **链接**: https://github.com/{repo.full_name}")
+                lines.append(f"- **描述**: {desc}")
+                if repo.pushed_at:
+                    lines.append(f"- **最后更新**: {repo.pushed_at.strftime('%Y-%m-%d')}")
+                lines.append("")
+            
+            # 生成简洁版（仅名称和描述，用于快速检索）
+            lines.append("---")
+            lines.append("")
+            lines.append("## 快速检索列表")
+            lines.append("")
+            lines.append("| 仓库 | 描述 |")
+            lines.append("|------|------|")
+            
+            for repo in sorted_repos:
+                if repo.is_deleted:
+                    continue
+                desc = (repo.description or "无描述")[:80]
+                desc = desc.replace("|", "/").replace("\n", " ")
+                lines.append(f"| {repo.full_name} | {desc} |")
+            
+            content = "\n".join(lines)
+            
+            # 写入临时文件
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                suffix='.md',
+                delete=False,
+                encoding='utf-8'
+            ) as f:
+                f.write(content)
+                temp_path = f.name
+            
+            # 上传到 WebDAV
+            self.webdav.upload_file(
+                temp_path,
+                "_index",
+                "repository_index.md"
+            )
+            
+            # 同时生成 JSON 格式（便于程序处理）
+            json_data = {
+                "generated_at": datetime.now().isoformat(),
+                "total_repos": len(repos),
+                "repositories": [
+                    {
+                        "full_name": r.full_name,
+                        "description": r.description,
+                        "html_url": f"https://github.com/{r.full_name}",
+                        "pushed_at": r.pushed_at.isoformat() if r.pushed_at else None,
+                        "is_deleted": r.is_deleted,
+                    }
+                    for r in sorted_repos
+                    if not r.is_deleted
+                ]
+            }
+            
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                suffix='.json',
+                delete=False,
+                encoding='utf-8'
+            ) as f:
+                json.dump(json_data, f, ensure_ascii=False, indent=2)
+                json_temp_path = f.name
+            
+            self.webdav.upload_file(
+                json_temp_path,
+                "_index",
+                "repository_index.json"
+            )
+            
+            # 清理临时文件
+            import os
+            os.unlink(temp_path)
+            os.unlink(json_temp_path)
+            
+            logger.info(f"仓库索引生成成功，共 {len(repos)} 个仓库")
+            return True
+            
+        except Exception as e:
+            logger.error(f"生成仓库索引失败: {e}")
+            return False
+
 
