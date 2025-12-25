@@ -106,18 +106,28 @@ class GitOperations:
         safe_name = repo_full_name.replace('/', '_')
         return self.temp_dir / "mirrors" / f"{safe_name}.git"
     
-    def clone_or_update_mirror(self, repo_full_name: str, clone_url: str) -> Tuple[bool, str]:
+    def clone_or_update_mirror(
+        self, 
+        repo_full_name: str, 
+        clone_url: str,
+        target_path: Path = None
+    ) -> Tuple[bool, str]:
         """
         克隆或更新仓库镜像
         
         Args:
             repo_full_name: 仓库完整名称
             clone_url: 克隆地址
+            target_path: 自定义目标路径（用于挂载模式）
             
         Returns:
             (是否有更新, 最新 commit hash)
         """
-        mirror_path = self.get_mirror_path(repo_full_name)
+        # 使用自定义路径或默认路径
+        if target_path:
+            mirror_path = target_path
+        else:
+            mirror_path = self.get_mirror_path(repo_full_name)
         
         if mirror_path.exists():
             # 已存在，执行 fetch 更新

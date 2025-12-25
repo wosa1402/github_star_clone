@@ -27,7 +27,7 @@
 ### 1. 克隆项目
 
 ```bash
-git clone <本项目地址>
+git clone https://github.com/wosa1402/github_star_clone
 cd github_star_clone
 ```
 

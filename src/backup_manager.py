@@ -2,10 +2,14 @@
 备份管理器模块
 
 负责协调整个备份流程，包括获取仓库列表、去重、更新检测和备份执行。
+支持两种模式：
+- 挂载模式（推荐）：使用 rclone 挂载 WebDAV，直接克隆仓库到挂载路径
+- 上传模式：克隆仓库到本地，创建 Bundle 后上传到 WebDAV
 """
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -31,9 +35,16 @@ class BackupManager:
             auto_restore_db: 是否自动从云端恢复数据库（默认开启）
         """
         self.config = config
+        self.mount = None  # WebDAV 挂载管理器
+        self.use_mount_mode = config.backup.use_mount_mode
         
-        # 初始化 WebDAV 客户端（优先，用于恢复数据库）
+        # 初始化 WebDAV 客户端
         self.webdav = WebDAVClient(config.webdav)
+        
+        # 挂载模式：初始化挂载管理器
+        if self.use_mount_mode:
+            from .webdav_mount import WebDAVMount
+            self.mount = WebDAVMount(config.webdav, config.backup.mount_point)
         
         # 尝试从云端恢复数据库（如果本地不存在）
         if auto_restore_db:
@@ -83,6 +94,7 @@ class BackupManager:
         执行完整备份流程
         
         支持断点续传和自动跳过配置/失败的仓库。
+        支持挂载模式（直接克隆到 WebDAV）和上传模式（创建 Bundle 后上传）。
         
         Returns:
             备份汇总
@@ -94,6 +106,15 @@ class BackupManager:
         start_index = 0
         
         try:
+            # 0. 挂载模式：挂载 WebDAV
+            if self.use_mount_mode and self.mount:
+                logger.info("挂载模式：正在挂载 WebDAV...")
+                if not self.mount.mount():
+                    logger.error("WebDAV 挂载失败，无法继续备份")
+                    await self.notifier.send_error_notification("WebDAV 挂载失败，请检查 rclone 配置")
+                    raise RuntimeError("WebDAV 挂载失败")
+                logger.info(f"✅ WebDAV 已挂载到 {self.mount.mount_point}")
+            
             # 1. 发送开始通知
             logger.info("开始备份流程")
             
@@ -320,7 +341,8 @@ class BackupManager:
         """
         备份单个仓库
         
-        备份完成后会立即清理本地镜像以节省磁盘空间。
+        挂载模式：直接克隆/更新到 WebDAV 挂载路径
+        上传模式：创建 Bundle 后上传到 WebDAV
         
         Args:
             repo: 仓库信息
@@ -329,7 +351,7 @@ class BackupManager:
             备份结果
         """
         result = BackupResult(repository=repo, success=False)
-        mirror_created = False  # 标记是否创建了镜像，用于清理
+        mirror_created = False  # 标记是否创建了本地镜像（仅上传模式使用）
         
         try:
             # 1. 检查仓库是否还存在
@@ -356,42 +378,140 @@ class BackupManager:
                 repo.clone_url = latest_info.clone_url
                 self.db.save_repository(repo)
             
-            # 3. 检查是否需要备份
+            clone_url = repo.clone_url or f"https://github.com/{repo.full_name}.git"
+            
+            # ========== 挂载模式 ==========
+            if self.use_mount_mode and self.mount and self.mount.is_mounted:
+                return await self._backup_mount_mode(repo, clone_url, result)
+            
+            # ========== 上传模式（Bundle）==========
+            return await self._backup_upload_mode(repo, clone_url, result)
+            
+        except Exception as e:
+            logger.error(f"备份失败 {repo.full_name}: {e}")
+            result.error_message = str(e)
+            await self.notifier.send_error_notification(str(e), repo)
+        
+        return result
+    
+    async def _backup_mount_mode(
+        self, 
+        repo: Repository, 
+        clone_url: str,
+        result: BackupResult
+    ) -> BackupResult:
+        """
+        挂载模式备份：直接克隆/更新到 WebDAV 挂载路径
+        
+        Args:
+            repo: 仓库信息
+            clone_url: 克隆地址
+            result: 备份结果对象
+            
+        Returns:
+            备份结果
+        """
+        try:
+            # 获取挂载路径上的仓库目标位置
+            target_path = self.mount.get_repo_path(repo.full_name)
+            
+            # 确保 owner 目录存在
+            owner = repo.full_name.split('/')[0]
+            self.mount.ensure_owner_dir(owner)
+            
+            # 克隆或更新镜像到挂载路径
+            logger.info(f"挂载模式备份: {repo.full_name} -> {target_path}")
+            
+            has_updates, current_commit = self.git.clone_or_update_mirror(
+                repo.full_name,
+                clone_url,
+                target_path=target_path
+            )
+            
+            if not has_updates:
+                logger.info(f"镜像无更新，跳过: {repo.full_name}")
+                result.skipped = True
+                result.success = True
+                return result
+            
+            # 记录备份
+            record = BackupRecord(
+                repo_id=repo.id,
+                bundle_name=f"{repo.full_name.replace('/', '_')}.git",
+                bundle_type=BundleType.FULL,  # 挂载模式使用完整镜像
+                commit_hash=current_commit,
+                file_size=0,  # 挂载模式不计算大小
+                cloud_path=str(target_path),
+                backup_time=datetime.now()
+            )
+            self.db.save_backup_record(record)
+            
+            # 上传 metadata.json
+            await self._upload_metadata_mount_mode(repo, current_commit, target_path)
+            
+            result.success = True
+            result.bundle_type = BundleType.FULL
+            result.cloud_path = str(target_path)
+            
+            logger.info(f"✅ 备份成功: {repo.full_name}")
+            
+        except Exception as e:
+            logger.error(f"挂载模式备份失败 {repo.full_name}: {e}")
+            result.error_message = str(e)
+        
+        return result
+    
+    async def _backup_upload_mode(
+        self, 
+        repo: Repository, 
+        clone_url: str,
+        result: BackupResult
+    ) -> BackupResult:
+        """
+        上传模式备份：克隆到本地，创建 Bundle 后上传到 WebDAV
+        
+        Args:
+            repo: 仓库信息
+            clone_url: 克隆地址
+            result: 备份结果对象
+            
+        Returns:
+            备份结果
+        """
+        mirror_created = False
+        
+        try:
+            # 检查是否需要备份
             latest_backup = self.db.get_latest_backup(repo.id)
             
             if latest_backup and repo.pushed_at:
-                # 比较上次备份时间和最新推送时间
                 if latest_backup.backup_time and latest_backup.backup_time >= repo.pushed_at:
                     logger.info(f"仓库无更新，跳过: {repo.full_name}")
                     result.skipped = True
                     result.success = True
                     return result
             
-            # 4. 克隆仓库镜像（每次都重新克隆以节省磁盘空间）
-            clone_url = repo.clone_url or f"https://github.com/{repo.full_name}.git"
+            # 克隆仓库镜像
             has_updates, current_commit = self.git.clone_or_update_mirror(
                 repo.full_name, 
                 clone_url
             )
-            mirror_created = True  # 标记已创建镜像
+            mirror_created = True
             
             if not has_updates and latest_backup:
                 logger.info(f"镜像无更新，跳过: {repo.full_name}")
                 result.skipped = True
                 result.success = True
-                # 清理镜像以节省磁盘空间
                 self.git.cleanup_mirror(repo.full_name)
                 return result
             
-            # 5. 创建 Bundle
+            # 创建 Bundle
             if latest_backup and latest_backup.commit_hash:
-                # 增量备份
                 bundle_result = self.git.create_incremental_bundle(
                     repo.full_name,
                     latest_backup.commit_hash
                 )
             else:
-                # 完整备份
                 bundle_result = self.git.create_full_bundle(repo.full_name)
             
             if not bundle_result.success:
@@ -399,12 +519,11 @@ class BackupManager:
                 return result
             
             if not bundle_result.bundle_path:
-                # 无新提交
                 result.skipped = True
                 result.success = True
                 return result
             
-            # 6. 上传到 WebDAV
+            # 上传到 WebDAV
             bundle_filename = bundle_result.bundle_path.split('/')[-1].split('\\')[-1]
             cloud_path = self.webdav.upload_file(
                 bundle_result.bundle_path,
@@ -416,7 +535,7 @@ class BackupManager:
                 result.error_message = "上传到 WebDAV 失败"
                 return result
             
-            # 7. 记录备份
+            # 记录备份
             record = BackupRecord(
                 repo_id=repo.id,
                 bundle_name=bundle_filename,
@@ -428,10 +547,10 @@ class BackupManager:
             )
             self.db.save_backup_record(record)
             
-            # 8. 上传 metadata.json（包含仓库描述等信息）
+            # 上传 metadata.json
             await self._upload_metadata(repo, bundle_result.commit_hash, cloud_path)
             
-            # 9. 清理本地 Bundle 文件
+            # 清理本地 Bundle 文件
             if self.config.backup.cleanup_temp:
                 self.git.cleanup_bundle(bundle_result.bundle_path)
             
@@ -443,12 +562,11 @@ class BackupManager:
             logger.info(f"备份成功: {repo.full_name} -> {cloud_path}")
             
         except Exception as e:
-            logger.error(f"备份失败 {repo.full_name}: {e}")
+            logger.error(f"上传模式备份失败 {repo.full_name}: {e}")
             result.error_message = str(e)
-            await self.notifier.send_error_notification(str(e), repo)
         
         finally:
-            # 无论成功与否，都清理镜像以节省磁盘空间
+            # 清理本地镜像
             if mirror_created:
                 try:
                     self.git.cleanup_mirror(repo.full_name)
@@ -457,6 +575,45 @@ class BackupManager:
                     logger.warning(f"清理镜像失败: {cleanup_error}")
         
         return result
+    
+    async def _upload_metadata_mount_mode(
+        self, 
+        repo: Repository, 
+        commit_hash: str,
+        target_path: Path
+    ) -> None:
+        """
+        挂载模式下上传 metadata.json（直接写入挂载目录）
+        """
+        import json
+        
+        try:
+            # 构建元数据
+            star_sources = self.db.get_star_sources(repo.id) if repo.id else []
+            
+            metadata = {
+                "full_name": repo.full_name,
+                "owner": repo.owner,
+                "name": repo.name,
+                "description": repo.description,
+                "html_url": repo.html_url or f"https://github.com/{repo.full_name}",
+                "clone_url": repo.clone_url,
+                "pushed_at": repo.pushed_at.isoformat() if repo.pushed_at else None,
+                "is_deleted": repo.is_deleted,
+                "last_backup_commit": commit_hash,
+                "last_backup_time": datetime.now().isoformat(),
+                "starred_by": star_sources,
+            }
+            
+            # 直接写入挂载目录
+            metadata_path = target_path.parent / "metadata.json"
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+            
+            logger.debug(f"已写入 metadata.json: {metadata_path}")
+            
+        except Exception as e:
+            logger.warning(f"写入 metadata.json 失败: {e}")
     
     async def backup_single(self, repo_full_name: str) -> BackupResult:
         """

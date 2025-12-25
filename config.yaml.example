@@ -63,4 +63,14 @@ backup:
   
   # 是否启用断点续传（从上次中断的位置继续）
   resume_from_last: true
+  
+  # ========== 挂载模式配置（推荐 Linux 服务器使用）==========
+  # 启用挂载模式：使用 rclone 挂载 WebDAV，直接克隆仓库到云端
+  # 优点：无需 Bundle，增量备份高效，无本地空间限制
+  # 注意：需要 Linux 系统，会自动安装 rclone
+  use_mount_mode: true
+  
+  # WebDAV 挂载点路径
+  mount_point: "/tmp/github-backup-mount"
+
 

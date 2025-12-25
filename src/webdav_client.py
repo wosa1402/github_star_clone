@@ -172,6 +172,9 @@ class WebDAVClient:
         Returns:
             远程路径或 None（失败时）
         """
+        import requests
+        from requests.auth import HTTPBasicAuth
+        
         local_file = Path(local_path)
         
         if not local_file.exists():
@@ -183,27 +186,42 @@ class WebDAVClient:
         
         # 确保目录存在
         remote_dir = f"{self.base_path}/{repo_full_name}"
-        if not self.ensure_directory(remote_dir):
-            return None
+        self.ensure_directory(remote_dir)  # 不检查返回值，继续尝试上传
         
+        # 构建远程路径
         remote_path = f"{remote_dir}/{filename}"
+        if not remote_path.startswith('/'):
+            remote_path = '/' + remote_path
+        
+        # 构建完整 URL
+        base_url = self.config.url.rstrip('/')
+        full_url = f"{base_url}{remote_path}"
         
         try:
-            logger.info(f"上传文件: {local_file.name} -> {remote_path}")
-            
-            # 上传文件
-            self.client.upload_sync(
-                remote_path=remote_path,
-                local_path=str(local_file)
-            )
-            
             file_size = local_file.stat().st_size
-            logger.info(f"上传成功: {filename} ({file_size} bytes)")
+            logger.info(f"上传文件: {local_file.name} ({file_size} bytes) -> {remote_path}")
             
-            return remote_path
+            # 使用 requests 直接 PUT 上传文件
+            auth = HTTPBasicAuth(self.config.username, self.config.password)
             
-        except WebDavException as e:
-            logger.error(f"上传失败: {e}")
+            with open(local_file, 'rb') as f:
+                response = requests.put(
+                    url=full_url,
+                    data=f,
+                    auth=auth,
+                    headers={'Content-Type': 'application/octet-stream'},
+                    timeout=1800  # 30 分钟超时（大文件）
+                )
+            
+            if response.status_code in [200, 201, 204]:
+                logger.info(f"上传成功: {filename} ({file_size} bytes)")
+                return remote_path
+            else:
+                logger.error(f"上传失败: HTTP {response.status_code} - {response.text[:200]}")
+                return None
+            
+        except requests.exceptions.Timeout:
+            logger.error(f"上传超时: {filename}")
             return None
         except Exception as e:
             logger.error(f"上传异常: {e}")
@@ -282,7 +300,7 @@ class WebDAVClient:
     
     def download_file(self, remote_path: str, local_path: str) -> bool:
         """
-        从 WebDAV 下载文件
+        从 WebDAV 下载文件（使用 requests 兼容 AList）
         
         Args:
             remote_path: 远程文件路径
@@ -291,30 +309,51 @@ class WebDAVClient:
         Returns:
             是否成功
         """
+        import requests
+        from requests.auth import HTTPBasicAuth
+        
         try:
-            # 检查远程文件是否存在
-            if not self.client.check(remote_path):
-                logger.debug(f"远程文件不存在: {remote_path}")
-                return False
+            # 确保路径格式正确
+            if not remote_path.startswith('/'):
+                remote_path = '/' + remote_path
+            
+            # 构建完整 URL
+            base_url = self.config.url.rstrip('/')
+            full_url = f"{base_url}{remote_path}"
             
             # 确保本地目录存在
             local_file = Path(local_path)
             local_file.parent.mkdir(parents=True, exist_ok=True)
             
-            # 下载文件
+            # 使用 requests 下载
             logger.info(f"下载文件: {remote_path} -> {local_path}")
-            self.client.download_sync(
-                remote_path=remote_path,
-                local_path=str(local_file)
+            auth = HTTPBasicAuth(self.config.username, self.config.password)
+            
+            response = requests.get(
+                url=full_url,
+                auth=auth,
+                stream=True,
+                timeout=300
             )
+            
+            if response.status_code == 404:
+                logger.debug(f"远程文件不存在: {remote_path}")
+                return False
+            
+            if response.status_code != 200:
+                logger.error(f"下载失败: HTTP {response.status_code}")
+                return False
+            
+            # 流式写入本地文件
+            with open(local_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
             
             logger.info(f"下载成功: {local_file.name}")
             return True
             
-        except WebDavException as e:
-            logger.error(f"下载失败: {e}")
-            return False
         except Exception as e:
             logger.error(f"下载异常: {e}")
             return False
+
 
