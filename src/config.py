@@ -81,7 +81,8 @@ class BackupConfig(BaseModel):
     # 断点续传：从上次中断的位置继续
     resume_from_last: bool = Field(default=True, description="是否从上次中断处继续")
     # 挂载模式：直接将仓库镜像备份到 WebDAV 挂载路径
-    use_mount_mode: bool = Field(default=True, description="使用挂载模式（推荐）")
+    # 注意：挂载模式对 Git 操作不稳定，建议使用上传模式
+    use_mount_mode: bool = Field(default=False, description="使用挂载模式（不推荐）")
     # 挂载点路径（仅 Linux）
     mount_point: str = Field(default="/tmp/github-backup-mount", description="WebDAV 挂载点")
 
