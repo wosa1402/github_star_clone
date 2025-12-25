@@ -58,7 +58,7 @@ class WebDAVClient:
     
     def ensure_directory(self, remote_path: str) -> bool:
         """
-        确保远程目录存在
+        确保远程目录存在（兼容 AList 等 WebDAV 服务器）
         
         Args:
             remote_path: 远程目录路径
@@ -67,33 +67,67 @@ class WebDAVClient:
             是否成功
         """
         path = remote_path.rstrip('/')
-        if not path:
+        if not path or path == '/':
             return True
         
+        # 确保路径以 / 开头
+        if not path.startswith('/'):
+            path = '/' + path
+        
         try:
-            # 检查目录是否存在
-            if self.client.check(path):
-                return True
-            
-            # 递归创建父目录
+            # 方法1：直接尝试创建目录（最兼容的方式）
+            # 先递归确保父目录存在
             parent = str(Path(path).parent).replace('\\', '/')
-            if parent and parent != '/':
+            if parent and parent != '/' and parent != path:
                 self.ensure_directory(parent)
             
-            # 创建当前目录
-            self.client.mkdir(path)
-            logger.debug(f"创建目录: {path}")
+            # 尝试创建目录（如果已存在，大多数服务器会返回成功或特定错误）
+            try:
+                self.client.mkdir(path)
+                logger.debug(f"创建目录: {path}")
+            except WebDavException as e:
+                error_str = str(e).lower()
+                # 忽略"已存在"类的错误
+                if any(kw in error_str for kw in ['already exists', 'exists', '405', 'method not allowed']):
+                    logger.debug(f"目录已存在: {path}")
+                else:
+                    raise
+            
             return True
             
         except WebDavException as e:
-            # 目录可能已存在
-            if "already exists" in str(e).lower():
+            error_str = str(e).lower()
+            # 这些错误可以忽略
+            if any(kw in error_str for kw in ['already exists', 'exists', '405']):
                 return True
             logger.error(f"创建目录失败 {path}: {e}")
             return False
         except Exception as e:
             logger.error(f"创建目录异常 {path}: {e}")
             return False
+    
+    def _check_path_exists(self, path: str) -> bool:
+        """
+        检查路径是否存在（兼容方式）
+        
+        Args:
+            path: 远程路径
+            
+        Returns:
+            是否存在
+        """
+        try:
+            # 尝试使用 check 方法
+            return self.client.check(path)
+        except Exception:
+            # 如果 check 不支持，尝试用 list 父目录的方式
+            try:
+                parent = str(Path(path).parent).replace('\\', '/')
+                name = Path(path).name
+                items = self.client.list(parent)
+                return name in items or f"{name}/" in items
+            except Exception:
+                return False
     
     def get_remote_path(self, repo_full_name: str, filename: str) -> str:
         """
