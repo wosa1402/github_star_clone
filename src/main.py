@@ -16,6 +16,8 @@ GitHub Star 仓库备份工具 - 主入口
 import argparse
 import asyncio
 import sys
+import os
+import fcntl
 from pathlib import Path
 
 from loguru import logger
@@ -24,6 +26,55 @@ from .backup_manager import BackupManager
 from .config import init_config, AppConfig
 from .scheduler import run_once, run_scheduler
 from .utils import setup_logger
+
+
+class ProcessLock:
+    """进程锁，防止重复运行"""
+    
+    def __init__(self, lock_file: str = "/tmp/github_backup.lock"):
+        self.lock_file = lock_file
+        self.lock_fd = None
+    
+    def acquire(self) -> bool:
+        """获取锁"""
+        try:
+            self.lock_fd = open(self.lock_file, 'w')
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # 写入 PID
+            self.lock_fd.write(str(os.getpid()))
+            self.lock_fd.flush()
+            return True
+        except (IOError, OSError):
+            # 锁已被占用
+            if self.lock_fd:
+                self.lock_fd.close()
+            return False
+    
+    def release(self):
+        """释放锁"""
+        if self.lock_fd:
+            try:
+                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+                self.lock_fd.close()
+                os.remove(self.lock_file)
+            except Exception:
+                pass
+    
+    def get_running_pid(self) -> int:
+        """获取正在运行的进程 PID"""
+        try:
+            with open(self.lock_file, 'r') as f:
+                return int(f.read().strip())
+        except Exception:
+            return 0
+    
+    def __enter__(self):
+        if not self.acquire():
+            return None
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
 
 
 def parse_args() -> argparse.Namespace:
@@ -265,13 +316,27 @@ async def main() -> int:
         result = await backup_single(config, args.backup_single)
         return 0 if result else 1
     
-    # 执行备份
-    if args.once:
-        # 只执行一次
-        await run_once(config)
-    else:
-        # 启动定时任务
-        await run_scheduler(config, run_immediately=args.run_now)
+    # 执行备份（需要获取进程锁）
+    lock = ProcessLock()
+    
+    if not lock.acquire():
+        running_pid = lock.get_running_pid()
+        print(f"⚠️ 备份任务已在运行中 (PID: {running_pid})")
+        print("如果确定没有运行，可以手动删除锁文件: rm /tmp/github_backup.lock")
+        return 1
+    
+    try:
+        logger.info(f"已获取进程锁 (PID: {os.getpid()})")
+        
+        if args.once:
+            # 只执行一次
+            await run_once(config)
+        else:
+            # 启动定时任务
+            await run_scheduler(config, run_immediately=args.run_now)
+    finally:
+        lock.release()
+        logger.info("已释放进程锁")
     
     return 0
 
