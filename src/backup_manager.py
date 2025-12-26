@@ -494,11 +494,22 @@ class BackupManager:
             latest_backup = self.db.get_latest_backup(repo.id)
             
             if latest_backup and repo.pushed_at:
-                if latest_backup.backup_time and latest_backup.backup_time >= repo.pushed_at:
-                    logger.info(f"仓库无更新，跳过: {repo.full_name}")
-                    result.skipped = True
-                    result.success = True
-                    return result
+                if latest_backup.backup_time:
+                    # 统一转换为无时区格式进行比较
+                    backup_time = latest_backup.backup_time
+                    pushed_at = repo.pushed_at
+                    
+                    # 移除时区信息（如果有）
+                    if backup_time.tzinfo is not None:
+                        backup_time = backup_time.replace(tzinfo=None)
+                    if pushed_at.tzinfo is not None:
+                        pushed_at = pushed_at.replace(tzinfo=None)
+                    
+                    if backup_time >= pushed_at:
+                        logger.info(f"仓库无更新，跳过: {repo.full_name}")
+                        result.skipped = True
+                        result.success = True
+                        return result
             
             # 克隆仓库镜像
             has_updates, current_commit = self.git.clone_or_update_mirror(
