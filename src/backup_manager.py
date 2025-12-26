@@ -225,10 +225,12 @@ class BackupManager:
                     status=status
                 )
                 
-                # 等待 60 秒后再开始下一个仓库（避免过度占用资源）
-                if i < summary.total_repos and not storage_full:
-                    logger.info("等待 60 秒后开始下一个仓库...")
-                    await asyncio.sleep(60)
+                # 只有真正执行了备份（成功上传）才等待 60 秒
+                # 跳过和失败的仓库不需要等待
+                if result.success and not result.skipped and not result.is_deleted:
+                    if i < summary.total_repos and not storage_full:
+                        logger.info("等待 60 秒后开始下一个仓库...")
+                        await asyncio.sleep(60)
             
             # 7. 生成仓库描述索引文件
             logger.info("生成仓库描述索引文件...")
