@@ -16,7 +16,7 @@ from .models import BackupResult, BackupSummary, Repository
 
 
 class TelegramNotifier:
-    """Telegram 通知类"""
+    """Telegram 通知类 - 支持消息编辑模式"""
     
     def __init__(self, config: TelegramConfig):
         """
@@ -32,36 +32,99 @@ class TelegramNotifier:
             self.bot = Bot(token=config.bot_token)
         else:
             self.bot = None
+        
+        # 进度消息 ID（用于编辑更新）
+        self.progress_message_id: Optional[int] = None
+        # 超时时间（秒）
+        self.timeout = 30
     
-    async def _send_message(self, text: str, parse_mode: str = "HTML") -> bool:
+    async def _send_message(
+        self, 
+        text: str, 
+        parse_mode: str = "HTML",
+        reply_to_message_id: Optional[int] = None
+    ) -> Optional[int]:
         """
         发送消息
         
         Args:
             text: 消息内容
             parse_mode: 解析模式
+            reply_to_message_id: 回复的消息 ID
             
         Returns:
-            是否发送成功
+            消息 ID 或 None（失败时）
         """
         if not self.enabled or not self.bot:
             logger.debug(f"Telegram 通知已禁用，跳过: {text[:50]}...")
+            return None
+        
+        try:
+            message = await asyncio.wait_for(
+                self.bot.send_message(
+                    chat_id=self.config.chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_to_message_id=reply_to_message_id
+                ),
+                timeout=self.timeout
+            )
+            logger.debug("Telegram 消息发送成功")
+            return message.message_id
+        except asyncio.TimeoutError:
+            logger.error("Telegram 消息发送超时")
+            return None
+        except TelegramError as e:
+            logger.error(f"Telegram 消息发送失败: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Telegram 发送异常: {e}")
+            return None
+    
+    async def _edit_message(self, message_id: int, text: str, parse_mode: str = "HTML") -> bool:
+        """
+        编辑已有消息
+        
+        Args:
+            message_id: 要编辑的消息 ID
+            text: 新的消息内容
+            parse_mode: 解析模式
+            
+        Returns:
+            是否成功
+        """
+        if not self.enabled or not self.bot:
             return True
         
         try:
-            await self.bot.send_message(
-                chat_id=self.config.chat_id,
-                text=text,
-                parse_mode=parse_mode
+            await asyncio.wait_for(
+                self.bot.edit_message_text(
+                    chat_id=self.config.chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode=parse_mode
+                ),
+                timeout=self.timeout
             )
-            logger.debug("Telegram 消息发送成功")
+            logger.debug("Telegram 消息编辑成功")
             return True
+        except asyncio.TimeoutError:
+            logger.error("Telegram 消息编辑超时")
+            return False
         except TelegramError as e:
-            logger.error(f"Telegram 消息发送失败: {e}")
+            # 消息内容相同时会报错，忽略
+            if "message is not modified" in str(e).lower():
+                return True
+            logger.error(f"Telegram 消息编辑失败: {e}")
             return False
         except Exception as e:
-            logger.error(f"Telegram 发送异常: {e}")
+            logger.error(f"Telegram 编辑异常: {e}")
             return False
+    
+    def reset_progress_message(self):
+        """重置进度消息 ID（在发送错误消息后调用）"""
+        self.progress_message_id = None
+    
     
     async def send_start_notification(self, total_repos: int, users: list[str]) -> bool:
         """
@@ -137,7 +200,9 @@ class TelegramNotifier:
     
     async def send_error_notification(self, error_message: str, repo: Repository = None) -> bool:
         """
-        发送错误通知
+        发送错误通知（独立消息，并重置进度消息 ID）
+        
+        发送错误后，下一条进度通知会成为新消息。
         
         Args:
             error_message: 错误信息
@@ -150,16 +215,22 @@ class TelegramNotifier:
             message = (
                 "❌ <b>备份错误</b>\n\n"
                 f"📦 仓库: <code>{repo.full_name}</code>\n"
-                f"❗ 错误: {error_message}\n"
+                f"❗ 错误: {error_message[:200]}\n"
                 f"⏰ 时间: {self._get_current_time()}"
             )
         else:
             message = (
                 "❌ <b>备份错误</b>\n\n"
-                f"❗ 错误: {error_message}\n"
+                f"❗ 错误: {error_message[:200]}\n"
                 f"⏰ 时间: {self._get_current_time()}"
             )
-        return await self._send_message(message)
+        
+        result = await self._send_message(message)
+        
+        # 重置进度消息 ID，让下一条进度通知成为新消息
+        self.reset_progress_message()
+        
+        return result is not None
     
     async def send_progress_notification(
         self, 
@@ -172,7 +243,7 @@ class TelegramNotifier:
         status: str = "成功"
     ) -> bool:
         """
-        发送进度通知
+        发送进度通知（编辑模式：持续更新同一条消息）
         
         Args:
             current: 当前进度
@@ -192,16 +263,40 @@ class TelegramNotifier:
         # 状态图标
         status_icon = "✅" if status == "成功" else ("⏭️" if status == "跳过" else "❌")
         
+        # 进度条
+        bar_length = 20
+        filled = int(bar_length * current / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_length - filled)
+        
         message = (
-            f"📊 <b>备份进度 [{current}/{total}]</b>\n\n"
+            f"📊 <b>备份进度</b>\n\n"
+            f"[{bar}] {progress:.1f}%\n\n"
             f"{status_icon} <code>{repo_name}</code>\n"
             f"状态: {status}\n\n"
-            f"📈 进度: {progress:.1f}%\n"
+            f"📈 进度: {current}/{total}\n"
             f"✅ 成功: {success_count} | ⏭️ 跳过: {skipped_count} | ❌ 失败: {failed_count}\n"
             f"📦 剩余: {remaining} 个\n"
-            f"⏰ 时间: {self._get_current_time()}"
+            f"⏰ 更新: {self._get_current_time()}"
         )
-        return await self._send_message(message)
+        
+        # 如果已有进度消息，则编辑；否则发送新消息
+        if self.progress_message_id:
+            success = await self._edit_message(self.progress_message_id, message)
+            if not success:
+                # 编辑失败，尝试发送新消息
+                new_id = await self._send_message(message)
+                if new_id:
+                    self.progress_message_id = new_id
+                    return True
+                return False
+            return True
+        else:
+            # 首次发送进度消息
+            message_id = await self._send_message(message)
+            if message_id:
+                self.progress_message_id = message_id
+                return True
+            return False
     
     async def test_connection(self) -> bool:
         """

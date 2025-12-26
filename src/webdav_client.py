@@ -197,35 +197,52 @@ class WebDAVClient:
         base_url = self.config.url.rstrip('/')
         full_url = f"{base_url}{remote_path}"
         
-        try:
-            file_size = local_file.stat().st_size
-            logger.info(f"上传文件: {local_file.name} ({file_size} bytes) -> {remote_path}")
+        file_size = local_file.stat().st_size
+        logger.info(f"上传文件: {local_file.name} ({file_size} bytes) -> {remote_path}")
+        
+        # 重试机制
+        max_retries = 3
+        retry_delay = 10  # 秒
+        
+        for attempt in range(max_retries):
+            try:
+                # 使用 requests 直接 PUT 上传文件
+                auth = HTTPBasicAuth(self.config.username, self.config.password)
+                
+                with open(local_file, 'rb') as f:
+                    response = requests.put(
+                        url=full_url,
+                        data=f,
+                        auth=auth,
+                        headers={'Content-Type': 'application/octet-stream'},
+                        timeout=1800  # 30 分钟超时（大文件）
+                    )
+                
+                if response.status_code in [200, 201, 204]:
+                    logger.info(f"上传成功: {filename} ({file_size} bytes)")
+                    return remote_path
+                elif response.status_code == 405:
+                    # 405 通常是目录问题，不重试
+                    logger.error(f"上传失败: HTTP 405 - 请检查 WebDAV 配置")
+                    return None
+                else:
+                    logger.warning(f"上传失败 (尝试 {attempt + 1}/{max_retries}): HTTP {response.status_code}")
+                    
+            except requests.exceptions.Timeout:
+                logger.warning(f"上传超时 (尝试 {attempt + 1}/{max_retries}): {filename}")
+            except requests.exceptions.SSLError as e:
+                logger.warning(f"SSL 错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+            except Exception as e:
+                logger.warning(f"上传异常 (尝试 {attempt + 1}/{max_retries}): {e}")
             
-            # 使用 requests 直接 PUT 上传文件
-            auth = HTTPBasicAuth(self.config.username, self.config.password)
-            
-            with open(local_file, 'rb') as f:
-                response = requests.put(
-                    url=full_url,
-                    data=f,
-                    auth=auth,
-                    headers={'Content-Type': 'application/octet-stream'},
-                    timeout=1800  # 30 分钟超时（大文件）
-                )
-            
-            if response.status_code in [200, 201, 204]:
-                logger.info(f"上传成功: {filename} ({file_size} bytes)")
-                return remote_path
-            else:
-                logger.error(f"上传失败: HTTP {response.status_code} - {response.text[:200]}")
-                return None
-            
-        except requests.exceptions.Timeout:
-            logger.error(f"上传超时: {filename}")
-            return None
-        except Exception as e:
-            logger.error(f"上传异常: {e}")
-            return None
+            # 重试前等待
+            if attempt < max_retries - 1:
+                logger.info(f"等待 {retry_delay} 秒后重试...")
+                import time
+                time.sleep(retry_delay)
+        
+        logger.error(f"上传失败: 已重试 {max_retries} 次")
+        return None
     
     def file_exists(self, remote_path: str) -> bool:
         """

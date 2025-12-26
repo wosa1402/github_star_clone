@@ -571,17 +571,34 @@ class BackupManager:
             logger.info(f"备份成功: {repo.full_name} -> {cloud_path}")
             
         except Exception as e:
+            error_str = str(e)
             logger.error(f"上传模式备份失败 {repo.full_name}: {e}")
-            result.error_message = str(e)
+            result.error_message = error_str
+            
+            # 检测磁盘空间不足错误，自动添加到跳过列表
+            if self._is_disk_error(error_str):
+                logger.warning(f"检测到磁盘空间不足，将仓库添加到跳过列表: {repo.full_name}")
+                self.db.add_skipped_repo(repo.full_name, "磁盘空间不足")
         
         finally:
-            # 清理本地镜像
+            # 无论成功失败，都清理本地镜像和 Bundle
             if mirror_created:
                 try:
                     self.git.cleanup_mirror(repo.full_name)
                     logger.debug(f"已清理镜像: {repo.full_name}")
                 except Exception as cleanup_error:
                     logger.warning(f"清理镜像失败: {cleanup_error}")
+            
+            # 额外清理可能残留的 Bundle 文件
+            try:
+                import glob
+                from pathlib import Path
+                temp_bundles = glob.glob(str(Path(self.config.backup.temp_dir) / "bundles" / "*.bundle"))
+                for bundle in temp_bundles:
+                    Path(bundle).unlink(missing_ok=True)
+                    logger.debug(f"清理残留 Bundle: {bundle}")
+            except Exception:
+                pass
         
         return result
     
