@@ -170,14 +170,27 @@ class TelegramNotifier:
         
         status_str = "\n".join(status_items) if status_items else "无任务执行"
         
+        # 列出失败的仓库（最多 10 个）
+        failed_repos_str = ""
+        if summary.results:
+            failed_repos = [r.repository.full_name for r in summary.results 
+                          if not r.success and not r.skipped and not r.is_deleted]
+            if failed_repos:
+                display_repos = failed_repos[:10]
+                failed_repos_str = "\n\n❌ <b>失败仓库:</b>\n"
+                failed_repos_str += "\n".join([f"• <code>{name}</code>" for name in display_repos])
+                if len(failed_repos) > 10:
+                    failed_repos_str += f"\n... 还有 {len(failed_repos) - 10} 个"
+        
         message = (
             "✅ <b>GitHub Star 备份完成</b>\n\n"
             f"📦 总仓库数: {summary.total_repos}\n"
             f"{status_str}\n"
             f"⏱️ 耗时: {summary.duration_str}\n"
             f"⏰ 完成时间: {self._get_current_time()}"
+            f"{failed_repos_str}"
         )
-        return await self._send_message(message)
+        return await self._send_message(message) is not None
     
     async def send_deleted_warning(self, repo: Repository) -> bool:
         """
@@ -263,20 +276,31 @@ class TelegramNotifier:
         # 状态图标
         status_icon = "✅" if status == "成功" else ("⏭️" if status == "跳过" else "❌")
         
-        # 进度条
-        bar_length = 20
+        # 美化进度条：使用渐变色块
+        bar_length = 15
         filled = int(bar_length * current / total) if total > 0 else 0
-        bar = "█" * filled + "░" * (bar_length - filled)
+        bar = "🟩" * filled + "⬜" * (bar_length - filled)
+        
+        # 预估剩余时间（基于已完成数量）
+        eta_str = ""
+        if current > 0 and remaining > 0:
+            # 简单估算：假设每个需要备份的仓库平均 1 分钟
+            avg_time_per_repo = 60  # 秒
+            eta_seconds = remaining * avg_time_per_repo
+            if eta_seconds > 3600:
+                eta_str = f"⏳ 预计: {eta_seconds // 3600}小时{(eta_seconds % 3600) // 60}分钟"
+            elif eta_seconds > 60:
+                eta_str = f"⏳ 预计: {eta_seconds // 60}分钟"
         
         message = (
-            f"📊 <b>备份进度</b>\n\n"
-            f"[{bar}] {progress:.1f}%\n\n"
+            f"📊 <b>GitHub Star 备份中</b>\n\n"
+            f"{bar} {progress:.1f}%\n\n"
             f"{status_icon} <code>{repo_name}</code>\n"
             f"状态: {status}\n\n"
-            f"📈 进度: {current}/{total}\n"
-            f"✅ 成功: {success_count} | ⏭️ 跳过: {skipped_count} | ❌ 失败: {failed_count}\n"
-            f"📦 剩余: {remaining} 个\n"
-            f"⏰ 更新: {self._get_current_time()}"
+            f"📈 进度: {current}/{total} ({remaining} 剩余)\n"
+            f"✅{success_count} ⏭️{skipped_count} ❌{failed_count}\n"
+            + (f"{eta_str}\n" if eta_str else "")
+            + f"🕐 {self._get_current_time()}"
         )
         
         # 如果已有进度消息，则编辑；否则发送新消息
