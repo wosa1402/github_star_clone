@@ -185,7 +185,29 @@ class BackupManager:
                     last_repo_full_name=repo.full_name
                 )
                 
-                result = await self._backup_single_repo(repo)
+                # 创建后台心跳任务（每 60 秒刷新一次进度通知）
+                heartbeat_stop = asyncio.Event()
+                
+                async def heartbeat_task():
+                    while not heartbeat_stop.is_set():
+                        await asyncio.sleep(60)
+                        if not heartbeat_stop.is_set():
+                            await self.notifier.refresh_progress()
+                            logger.debug("心跳刷新进度通知")
+                
+                heartbeat = asyncio.create_task(heartbeat_task())
+                
+                try:
+                    result = await self._backup_single_repo(repo)
+                finally:
+                    # 停止心跳任务
+                    heartbeat_stop.set()
+                    heartbeat.cancel()
+                    try:
+                        await heartbeat
+                    except asyncio.CancelledError:
+                        pass
+                
                 summary.results.append(result)
                 
                 # 更新统计和状态
