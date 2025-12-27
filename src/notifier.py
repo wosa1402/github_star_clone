@@ -16,7 +16,7 @@ from .models import BackupResult, BackupSummary, Repository
 
 
 class TelegramNotifier:
-    """Telegram 通知类 - 支持消息编辑模式"""
+    """Telegram 通知类 - 支持消息编辑模式和心跳更新"""
     
     def __init__(self, config: TelegramConfig):
         """
@@ -37,6 +37,9 @@ class TelegramNotifier:
         self.progress_message_id: Optional[int] = None
         # 超时时间（秒）
         self.timeout = 30
+        
+        # 缓存最后一次进度通知的参数（用于心跳更新）
+        self._last_progress_params: Optional[dict] = None
     
     async def _send_message(
         self, 
@@ -270,37 +273,53 @@ class TelegramNotifier:
         Returns:
             是否发送成功
         """
+        # 缓存参数（用于心跳刷新）
+        self._last_progress_params = {
+            "current": current,
+            "total": total,
+            "repo_name": repo_name,
+            "success_count": success_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "status": status
+        }
+        
         progress = (current / total) * 100 if total > 0 else 0
         remaining = total - current
         
         # 状态图标
         status_icon = "✅" if status == "成功" else ("⏭️" if status == "跳过" else "❌")
         
-        # 美化进度条：使用渐变色块
-        bar_length = 15
+        # 美观进度条：使用渐变块
+        bar_length = 10
         filled = int(bar_length * current / total) if total > 0 else 0
-        bar = "🟩" * filled + "⬜" * (bar_length - filled)
+        # 使用不同风格的块字符
+        bar_filled = "▓" * filled
+        bar_empty = "░" * (bar_length - filled)
+        bar = f"[{bar_filled}{bar_empty}]"
         
-        # 预估剩余时间（基于已完成数量）
+        # 预估剩余时间
         eta_str = ""
         if current > 0 and remaining > 0:
-            # 简单估算：假设每个需要备份的仓库平均 1 分钟
-            avg_time_per_repo = 60  # 秒
-            eta_seconds = remaining * avg_time_per_repo
+            avg_time = 60  # 平均每个仓库 60 秒
+            eta_seconds = remaining * avg_time
             if eta_seconds > 3600:
-                eta_str = f"⏳ 预计: {eta_seconds // 3600}小时{(eta_seconds % 3600) // 60}分钟"
+                eta_str = f"⏳ 约 {eta_seconds // 3600}h {(eta_seconds % 3600) // 60}m"
             elif eta_seconds > 60:
-                eta_str = f"⏳ 预计: {eta_seconds // 60}分钟"
+                eta_str = f"⏳ 约 {eta_seconds // 60}m"
+            else:
+                eta_str = f"⏳ 约 {eta_seconds}s"
         
         message = (
-            f"📊 <b>GitHub Star 备份中</b>\n\n"
-            f"{bar} {progress:.1f}%\n\n"
-            f"{status_icon} <code>{repo_name}</code>\n"
-            f"状态: {status}\n\n"
-            f"📈 进度: {current}/{total} ({remaining} 剩余)\n"
-            f"✅{success_count} ⏭️{skipped_count} ❌{failed_count}\n"
+            f"📊 <b>GitHub Star 备份中</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{bar} <b>{progress:.1f}%</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{status_icon} <code>{repo_name}</code>\n\n"
+            f"📈 {current}/{total} ({remaining} 剩余)\n"
+            f"✅ {success_count}  ⏭️ {skipped_count}  ❌ {failed_count}\n"
             + (f"{eta_str}\n" if eta_str else "")
-            + f"🕐 {self._get_current_time()}"
+            + f"\n🕐 更新于 {self._get_current_time()}"
         )
         
         # 如果已有进度消息，则编辑；否则发送新消息
@@ -321,6 +340,21 @@ class TelegramNotifier:
                 self.progress_message_id = message_id
                 return True
             return False
+    
+    async def refresh_progress(self) -> bool:
+        """
+        刷新进度通知（心跳更新，只更新时间戳）
+        
+        使用缓存的参数重新发送进度通知，用于让用户知道程序还在运行。
+        
+        Returns:
+            是否刷新成功
+        """
+        if not self._last_progress_params:
+            return False
+        
+        # 使用缓存的参数重新发送
+        return await self.send_progress_notification(**self._last_progress_params)
     
     async def test_connection(self) -> bool:
         """
