@@ -92,6 +92,20 @@ class GitOperations:
             logger.error(f"Git 命令失败: {e.stderr}")
             raise
     
+    async def _run_git_command_async(
+        self, 
+        args: list[str], 
+        cwd: str = None, 
+        check: bool = True
+    ) -> subprocess.CompletedProcess:
+        """
+        异步执行 Git 命令（在线程池中运行）
+        
+        这样可以让 asyncio 的其他任务（如心跳更新）在 Git 克隆期间继续执行。
+        """
+        import asyncio
+        return await asyncio.to_thread(self._run_git_command, args, cwd, check)
+    
     def get_mirror_path(self, repo_full_name: str) -> Path:
         """
         获取仓库镜像的本地路径
@@ -106,14 +120,14 @@ class GitOperations:
         safe_name = repo_full_name.replace('/', '_')
         return self.temp_dir / "mirrors" / f"{safe_name}.git"
     
-    def clone_or_update_mirror(
+    async def clone_or_update_mirror(
         self, 
         repo_full_name: str, 
         clone_url: str,
         target_path: Path = None
     ) -> Tuple[bool, str]:
         """
-        克隆或更新仓库镜像
+        克隆或更新仓库镜像（异步方法）
         
         Args:
             repo_full_name: 仓库完整名称
@@ -136,8 +150,8 @@ class GitOperations:
             # 获取更新前的 HEAD
             old_head = self._get_head_commit(mirror_path)
             
-            # 执行 fetch
-            self._run_git_command(
+            # 执行 fetch（异步）
+            await self._run_git_command_async(
                 ["fetch", "--all", "--prune"],
                 cwd=str(mirror_path)
             )
@@ -155,7 +169,8 @@ class GitOperations:
             
             mirror_path.parent.mkdir(parents=True, exist_ok=True)
             
-            self._run_git_command([
+            # 异步克隆
+            await self._run_git_command_async([
                 "clone", "--mirror", clone_url, str(mirror_path)
             ])
             
