@@ -446,7 +446,7 @@ class BackupManager:
             # 克隆或更新镜像到挂载路径
             logger.info(f"挂载模式备份: {repo.full_name} -> {target_path}")
             
-            has_updates, current_commit = self.git.clone_or_update_mirror(
+            has_updates, current_commit = await self.git.clone_or_update_mirror(
                 repo.full_name,
                 clone_url,
                 target_path=target_path
@@ -536,7 +536,7 @@ class BackupManager:
                         return result
             
             # 克隆仓库镜像
-            has_updates, current_commit = self.git.clone_or_update_mirror(
+            has_updates, current_commit = await self.git.clone_or_update_mirror(
                 repo.full_name, 
                 clone_url
             )
