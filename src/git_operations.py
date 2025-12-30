@@ -353,7 +353,9 @@ class GitOperations:
             
         except subprocess.CalledProcessError as e:
             # 增量 Bundle 创建失败时，尝试创建完整备份
-            logger.warning(f"增量备份失败，尝试完整备份: {e.stderr}")
+            # 这是正常的回退行为，比如仓库被 force push 导致历史丢失
+            logger.info(f"增量备份失败（commit 不存在），回退到完整备份")
+            logger.debug(f"增量备份失败详情: {e.stderr if e.stderr else str(e)}")
             return self.create_full_bundle(repo_full_name, output_dir)
     
     def cleanup_mirror(self, repo_full_name: str) -> None:
