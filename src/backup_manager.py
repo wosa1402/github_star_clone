@@ -284,8 +284,9 @@ class BackupManager:
         return summary
     
     def _is_disk_error(self, error_message: str) -> bool:
-        """判断错误是否是本地磁盘空间不足"""
+        """判断错误是否是本地磁盘空间不足或内存不足（OOM）"""
         disk_error_keywords = [
+            # 磁盘空间不足
             "No space left on device",
             "no space left",
             "disk full",
@@ -293,6 +294,14 @@ class BackupManager:
             "磁盘空间不足",
             "out of disk space",
             "ENOSPC",
+            # 内存不足 (OOM)
+            "signal 9",  # OOM Killer
+            "died of signal 9",
+            "pack-objects died",
+            "Cannot allocate memory",
+            "out of memory",
+            "oom",
+            "内存不足",
         ]
         error_lower = error_message.lower()
         return any(kw.lower() in error_lower for kw in disk_error_keywords)
