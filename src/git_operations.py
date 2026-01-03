@@ -211,6 +211,36 @@ class GitOperations:
             logger.warning(f"获取引用失败: {e}")
         return []
     
+    def commit_exists(self, repo_path: Path, commit_hash: str) -> bool:
+        """
+        检查 commit 是否存在于仓库中
+        
+        用于检测仓库是否被 force push 导致历史丢失
+        
+        Args:
+            repo_path: 仓库路径
+            commit_hash: 要检查的 commit hash
+            
+        Returns:
+            True 如果 commit 存在，False 如果不存在
+        """
+        if not commit_hash:
+            return False
+        
+        try:
+            result = self._run_git_command(
+                ["cat-file", "-e", commit_hash],
+                cwd=str(repo_path),
+                check=False
+            )
+            exists = result.returncode == 0
+            if not exists:
+                logger.info(f"Commit {commit_hash[:8]} 不存在，仓库可能被 force push")
+            return exists
+        except Exception as e:
+            logger.warning(f"检查 commit 存在性失败: {e}")
+            return False
+    
     def create_full_bundle(
         self, 
         repo_full_name: str,
