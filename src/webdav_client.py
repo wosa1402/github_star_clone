@@ -300,6 +300,78 @@ class WebDAVClient:
             logger.error(f"删除文件失败 {remote_path}: {e}")
             return False
     
+    def archive_backups(self, repo_full_name: str) -> bool:
+        """
+        归档仓库的所有现有备份文件到子目录
+        
+        当检测到仓库被 force push 导致历史丢失时调用。
+        将所有现有的 bundle 文件移动到 archived_YYYYMMDD/ 子目录。
+        
+        Args:
+            repo_full_name: 仓库完整名称
+            
+        Returns:
+            是否成功
+        """
+        import requests
+        from requests.auth import HTTPBasicAuth
+        from datetime import datetime
+        
+        try:
+            # 获取仓库目录
+            repo_dir = f"{self.base_path}/{repo_full_name}"
+            
+            # 列出现有文件
+            files = self.list_files(repo_dir)
+            bundle_files = [f for f in files if f.endswith('.bundle')]
+            
+            if not bundle_files:
+                logger.info(f"没有需要归档的备份文件: {repo_full_name}")
+                return True
+            
+            # 创建归档目录
+            timestamp = datetime.now().strftime("%Y%m%d")
+            archive_dir = f"{repo_dir}/archived_{timestamp}"
+            self.ensure_directory(archive_dir)
+            
+            # 移动文件到归档目录
+            base_url = self.config.url.rstrip('/')
+            auth = HTTPBasicAuth(self.config.username, self.config.password)
+            
+            for filename in bundle_files:
+                src_path = f"{repo_dir}/{filename}"
+                dst_path = f"{archive_dir}/{filename}"
+                
+                # 使用 MOVE 请求移动文件
+                src_url = f"{base_url}{src_path}"
+                dst_url = f"{base_url}{dst_path}"
+                
+                try:
+                    response = requests.request(
+                        method='MOVE',
+                        url=src_url,
+                        auth=auth,
+                        headers={'Destination': dst_url, 'Overwrite': 'T'},
+                        timeout=60
+                    )
+                    
+                    if response.status_code in [200, 201, 204]:
+                        logger.info(f"已归档: {filename} -> archived_{timestamp}/")
+                    else:
+                        # MOVE 可能不被支持，尝试复制后删除
+                        logger.warning(f"移动文件失败 (HTTP {response.status_code})，尝试复制后删除")
+                        # 这里不做复制，因为可能是大文件，让它保留在原位
+                        
+                except Exception as e:
+                    logger.warning(f"移动文件失败 {filename}: {e}")
+            
+            logger.info(f"归档完成: {repo_full_name} -> archived_{timestamp}/")
+            return True
+            
+        except Exception as e:
+            logger.error(f"归档备份失败 {repo_full_name}: {e}")
+            return False
+    
     def get_backup_files(self, repo_full_name: str) -> list[str]:
         """
         获取仓库的所有备份文件
