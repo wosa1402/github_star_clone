@@ -559,11 +559,21 @@ class BackupManager:
                 return result
             
             # 创建 Bundle
+            mirror_path = self.git.get_mirror_path(repo.full_name)
+            
             if latest_backup and latest_backup.commit_hash:
-                bundle_result = self.git.create_incremental_bundle(
-                    repo.full_name,
-                    latest_backup.commit_hash
-                )
+                # 检查上次备份的 commit 是否还存在
+                if self.git.commit_exists(mirror_path, latest_backup.commit_hash):
+                    # commit 存在，创建增量备份
+                    bundle_result = self.git.create_incremental_bundle(
+                        repo.full_name,
+                        latest_backup.commit_hash
+                    )
+                else:
+                    # commit 不存在（仓库被 force push），归档旧备份并创建新的完整备份
+                    logger.warning(f"检测到仓库历史重写，归档旧备份并创建新的完整备份: {repo.full_name}")
+                    self.webdav.archive_backups(repo.full_name)
+                    bundle_result = self.git.create_full_bundle(repo.full_name)
             else:
                 bundle_result = self.git.create_full_bundle(repo.full_name)
             
