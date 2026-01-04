@@ -572,7 +572,11 @@ class BackupManager:
                 else:
                     # commit 不存在（仓库被 force push），归档旧备份并创建新的完整备份
                     logger.warning(f"检测到仓库历史重写，归档旧备份并创建新的完整备份: {repo.full_name}")
-                    self.webdav.archive_backups(repo.full_name)
+                    # 尝试归档，失败也继续（归档是可选操作）
+                    try:
+                        self.webdav.archive_backups(repo.full_name)
+                    except Exception as archive_error:
+                        logger.warning(f"归档失败（继续备份）: {archive_error}")
                     bundle_result = self.git.create_full_bundle(repo.full_name)
             else:
                 bundle_result = self.git.create_full_bundle(repo.full_name)
