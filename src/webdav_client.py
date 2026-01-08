@@ -222,18 +222,19 @@ class WebDAVClient:
                     logger.info(f"上传成功: {filename} ({file_size} bytes)")
                     return remote_path
                 elif response.status_code == 405:
-                    # 405 可能是文件已存在或目录问题
-                    logger.warning(f"HTTP 405 错误，检查文件是否已存在: {remote_path}")
-                    # 尝试删除现有文件后重试
-                    if self.file_exists(remote_path):
-                        logger.info(f"文件已存在，尝试删除后重新上传: {remote_path}")
-                        self.delete_file(remote_path)
-                        # 继续循环重试
-                        continue
-                    else:
-                        # 不是文件存在问题，可能是目录配置问题
+                    # 405 可能是 PUT 方法不被允许，尝试使用 webdavclient3 库
+                    logger.warning(f"PUT 方法返回 405，尝试使用 WebDAV 客户端库上传")
+                    try:
+                        self.client.upload_sync(
+                            remote_path=remote_path,
+                            local_path=str(local_file)
+                        )
+                        logger.info(f"使用 WebDAV 客户端库上传成功: {filename}")
+                        return remote_path
+                    except Exception as webdav_error:
+                        logger.error(f"WebDAV 客户端库上传也失败: {webdav_error}")
                         logger.error(f"上传失败: HTTP 405 - 路径: {full_url}")
-                        logger.error(f"请检查 WebDAV 配置和目录权限")
+                        logger.error(f"请检查 AList WebDAV 配置：确保用户有写入权限")
                         return None
                 else:
                     logger.warning(f"上传失败 (尝试 {attempt + 1}/{max_retries}): HTTP {response.status_code}")
