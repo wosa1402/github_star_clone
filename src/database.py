@@ -301,6 +301,30 @@ class Database:
             """, (repo_id, limit))
             return [self._row_to_backup_record(row) for row in cursor.fetchall()]
     
+    def delete_backup_records(self, repo_id: int) -> int:
+        """
+        删除仓库的所有备份记录
+        
+        当 WebDAV 上的备份文件不存在但数据库有记录时调用，
+        用于重置备份状态，让系统重新做完整备份。
+        
+        Args:
+            repo_id: 仓库 ID
+            
+        Returns:
+            删除的记录数
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM backup_records WHERE repo_id = ?",
+                (repo_id,)
+            )
+            deleted_count = cursor.rowcount
+            if deleted_count > 0:
+                logger.info(f"已删除仓库 ID={repo_id} 的 {deleted_count} 条备份记录")
+            return deleted_count
+    
     # ========== Star 来源操作 ==========
     
     def add_star_source(self, repo_id: int, github_user: str) -> None:

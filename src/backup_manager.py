@@ -526,6 +526,17 @@ class BackupManager:
             # 检查是否需要备份
             latest_backup = self.db.get_latest_backup(repo.id)
             
+            # 检测 WebDAV 上是否存在备份文件（如果数据库有记录）
+            if latest_backup and latest_backup.cloud_path:
+                # 检查 WebDAV 上是否有该仓库的备份文件
+                backup_files = self.webdav.get_backup_files(repo.full_name)
+                if not backup_files:
+                    # WebDAV 上没有备份文件，但数据库有记录
+                    # 清除该仓库的备份记录，重新做完整备份
+                    logger.warning(f"WebDAV 上没有备份文件但数据库有记录，重置备份状态: {repo.full_name}")
+                    self.db.delete_backup_records(repo.id)
+                    latest_backup = None  # 重置，让后续逻辑做完整备份
+            
             if latest_backup and repo.pushed_at:
                 if latest_backup.backup_time:
                     # 统一转换为无时区格式进行比较
