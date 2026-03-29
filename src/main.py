@@ -17,8 +17,18 @@ import argparse
 import asyncio
 import sys
 import os
-import fcntl
+import tempfile
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 from loguru import logger
 
@@ -31,16 +41,51 @@ from .utils import setup_logger
 class ProcessLock:
     """进程锁，防止重复运行"""
     
-    def __init__(self, lock_file: str = "/tmp/github_backup.lock"):
-        self.lock_file = lock_file
+    def __init__(self, lock_file: str | None = None):
+        default_lock_file = Path(tempfile.gettempdir()) / "github_backup.lock"
+        self.lock_file = str(Path(lock_file) if lock_file else default_lock_file)
         self.lock_fd = None
+        self._lock_backend = None
+    
+    def _acquire_platform_lock(self) -> None:
+        """根据平台获取文件锁。"""
+        if fcntl is not None:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_backend = "fcntl"
+            return
+        
+        if msvcrt is not None:
+            self.lock_fd.seek(0)
+            msvcrt.locking(self.lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            self._lock_backend = "msvcrt"
+            return
+        
+        raise RuntimeError("当前平台不支持文件锁")
+    
+    def _release_platform_lock(self) -> None:
+        """根据平台释放文件锁。"""
+        if not self.lock_fd or not self._lock_backend:
+            return
+        
+        if self._lock_backend == "fcntl" and fcntl is not None:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+        elif self._lock_backend == "msvcrt" and msvcrt is not None:
+            self.lock_fd.seek(0)
+            msvcrt.locking(self.lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+        
+        self._lock_backend = None
     
     def acquire(self) -> bool:
         """获取锁"""
         try:
-            self.lock_fd = open(self.lock_file, 'w')
-            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_path = Path(self.lock_file)
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            mode = 'r+' if lock_path.exists() else 'w+'
+            self.lock_fd = open(lock_path, mode, encoding='utf-8')
+            self._acquire_platform_lock()
             # 写入 PID
+            self.lock_fd.seek(0)
+            self.lock_fd.truncate()
             self.lock_fd.write(str(os.getpid()))
             self.lock_fd.flush()
             return True
@@ -48,15 +93,17 @@ class ProcessLock:
             # 锁已被占用
             if self.lock_fd:
                 self.lock_fd.close()
+                self.lock_fd = None
             return False
     
     def release(self):
         """释放锁"""
         if self.lock_fd:
             try:
-                fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+                self._release_platform_lock()
                 self.lock_fd.close()
-                os.remove(self.lock_file)
+                self.lock_fd = None
+                Path(self.lock_file).unlink(missing_ok=True)
             except Exception:
                 pass
     
@@ -322,7 +369,7 @@ async def main() -> int:
     if not lock.acquire():
         running_pid = lock.get_running_pid()
         print(f"⚠️ 备份任务已在运行中 (PID: {running_pid})")
-        print("如果确定没有运行，可以手动删除锁文件: rm /tmp/github_backup.lock")
+        print(f"如果确定没有运行，可以手动删除锁文件: {lock.lock_file}")
         return 1
     
     try:

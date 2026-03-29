@@ -17,7 +17,7 @@ from .config import WebDAVConfig
 class WebDAVClient:
     """WebDAV 客户端类"""
     
-    def __init__(self, config: WebDAVConfig):
+    def __init__(self, config: WebDAVConfig, max_retries: int = 3, retry_delay: int = 10):
         """
         初始化 WebDAV 客户端
         
@@ -26,6 +26,9 @@ class WebDAVClient:
         """
         self.config = config
         self.base_path = config.base_path.rstrip('/')
+        self.max_retries = max(1, max_retries)
+        self.retry_delay = max(0, retry_delay)
+        self.last_error: Optional[str] = None
         
         # 配置 WebDAV 客户端
         options = {
@@ -176,9 +179,11 @@ class WebDAVClient:
         from requests.auth import HTTPBasicAuth
         
         local_file = Path(local_path)
+        self.last_error = None
         
         if not local_file.exists():
-            logger.error(f"本地文件不存在: {local_path}")
+            self.last_error = f"本地文件不存在: {local_path}"
+            logger.error(self.last_error)
             return None
         
         if filename is None:
@@ -201,8 +206,8 @@ class WebDAVClient:
         logger.info(f"上传文件: {local_file.name} ({file_size} bytes) -> {remote_path}")
         
         # 重试机制
-        max_retries = 3
-        retry_delay = 10  # 秒
+        max_retries = self.max_retries
+        retry_delay = self.retry_delay
         
         for attempt in range(max_retries):
             try:
@@ -219,6 +224,7 @@ class WebDAVClient:
                     )
                 
                 if response.status_code in [200, 201, 204]:
+                    self.last_error = None
                     logger.info(f"上传成功: {filename} ({file_size} bytes)")
                     return remote_path
                 elif response.status_code == 405:
@@ -229,22 +235,31 @@ class WebDAVClient:
                             remote_path=remote_path,
                             local_path=str(local_file)
                         )
+                        self.last_error = None
                         logger.info(f"使用 WebDAV 客户端库上传成功: {filename}")
                         return remote_path
                     except Exception as webdav_error:
+                        self.last_error = f"HTTP 405，WebDAV 客户端库上传失败: {webdav_error}"
                         logger.error(f"WebDAV 客户端库上传也失败: {webdav_error}")
                         logger.error(f"上传失败: HTTP 405 - 路径: {full_url}")
                         logger.error(f"请检查 AList WebDAV 配置：确保用户有写入权限")
                         return None
                 else:
-                    logger.warning(f"上传失败 (尝试 {attempt + 1}/{max_retries}): HTTP {response.status_code}")
+                    response_detail = response.text.strip()[:200]
+                    self.last_error = f"上传失败: HTTP {response.status_code}"
+                    if response_detail:
+                        self.last_error = f"{self.last_error} - {response_detail}"
+                    logger.warning(f"{self.last_error} (尝试 {attempt + 1}/{max_retries})")
                     
             except requests.exceptions.Timeout:
-                logger.warning(f"上传超时 (尝试 {attempt + 1}/{max_retries}): {filename}")
+                self.last_error = f"上传超时: {filename}"
+                logger.warning(f"{self.last_error} (尝试 {attempt + 1}/{max_retries})")
             except requests.exceptions.SSLError as e:
-                logger.warning(f"SSL 错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+                self.last_error = f"SSL 错误: {e}"
+                logger.warning(f"{self.last_error} (尝试 {attempt + 1}/{max_retries})")
             except Exception as e:
-                logger.warning(f"上传异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+                self.last_error = f"上传异常: {e}"
+                logger.warning(f"{self.last_error} (尝试 {attempt + 1}/{max_retries})")
             
             # 重试前等待
             if attempt < max_retries - 1:
@@ -252,7 +267,7 @@ class WebDAVClient:
                 import time
                 time.sleep(retry_delay)
         
-        logger.error(f"上传失败: 已重试 {max_retries} 次")
+        logger.error(self.last_error or f"上传失败: 已重试 {max_retries} 次")
         return None
     
     def file_exists(self, remote_path: str) -> bool:
@@ -266,7 +281,7 @@ class WebDAVClient:
             是否存在
         """
         try:
-            return self.client.check(remote_path)
+            return self._check_path_exists(remote_path)
         except Exception:
             return False
     
@@ -281,7 +296,7 @@ class WebDAVClient:
             文件名列表
         """
         try:
-            if not self.client.check(remote_dir):
+            if not self._check_path_exists(remote_dir):
                 return []
             
             items = self.client.list(remote_dir)
@@ -302,7 +317,7 @@ class WebDAVClient:
             是否成功
         """
         try:
-            if self.client.check(remote_path):
+            if self._check_path_exists(remote_path):
                 self.client.clean(remote_path)
                 logger.debug(f"已删除远程文件: {remote_path}")
                 return True

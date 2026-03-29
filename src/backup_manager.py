@@ -39,7 +39,11 @@ class BackupManager:
         self.use_mount_mode = config.backup.use_mount_mode
         
         # 初始化 WebDAV 客户端
-        self.webdav = WebDAVClient(config.webdav)
+        self.webdav = WebDAVClient(
+            config.webdav,
+            max_retries=config.backup.max_retries,
+            retry_delay=config.backup.retry_delay,
+        )
         
         # 挂载模式：初始化挂载管理器
         if self.use_mount_mode:
@@ -131,12 +135,8 @@ class BackupManager:
             if self.config.backup.resume_from_last:
                 last_progress = self.db.get_last_progress()
                 if last_progress:
-                    # 找到上次中断的位置
-                    last_repo = last_progress['last_repo_full_name']
-                    for idx, repo in enumerate(unique_repos):
-                        if repo.full_name == last_repo:
-                            start_index = idx + 1  # 从下一个开始
-                            break
+                    saved_index = int(last_progress.get('current_index') or 0)
+                    start_index = min(max(saved_index - 1, 0), len(unique_repos))
                     
                     if start_index > 0:
                         logger.info(f"从断点继续: 跳过前 {start_index} 个仓库，从第 {start_index + 1} 个开始")
@@ -173,40 +173,29 @@ class BackupManager:
                 if repo.full_name in skip_set:
                     logger.info(f"跳过仓库（在跳过列表中）: {repo.full_name}")
                     result = BackupResult(repository=repo, success=True, skipped=True)
-                    summary.results.append(result)
-                    summary.skipped_count += 1
-                    continue
-                
-                # 保存进度
-                self.db.save_backup_progress(
-                    session_id=session_id,
-                    total_repos=summary.total_repos,
-                    current_index=i,
-                    last_repo_full_name=repo.full_name
-                )
-                
-                # 创建后台心跳任务（每 60 秒刷新一次进度通知）
-                heartbeat_stop = asyncio.Event()
-                
-                async def heartbeat_task():
-                    while not heartbeat_stop.is_set():
-                        await asyncio.sleep(60)
-                        if not heartbeat_stop.is_set():
-                            await self.notifier.refresh_progress()
-                            logger.debug("心跳刷新进度通知")
-                
-                heartbeat = asyncio.create_task(heartbeat_task())
-                
-                try:
-                    result = await self._backup_single_repo(repo)
-                finally:
-                    # 停止心跳任务
-                    heartbeat_stop.set()
-                    heartbeat.cancel()
+                else:
+                    # 创建后台心跳任务（每 60 秒刷新一次进度通知）
+                    heartbeat_stop = asyncio.Event()
+                    
+                    async def heartbeat_task():
+                        while not heartbeat_stop.is_set():
+                            await asyncio.sleep(60)
+                            if not heartbeat_stop.is_set():
+                                await self.notifier.refresh_progress()
+                                logger.debug("心跳刷新进度通知")
+                    
+                    heartbeat = asyncio.create_task(heartbeat_task())
+                    
                     try:
-                        await heartbeat
-                    except asyncio.CancelledError:
-                        pass
+                        result = await self._backup_single_repo(repo)
+                    finally:
+                        # 停止心跳任务
+                        heartbeat_stop.set()
+                        heartbeat.cancel()
+                        try:
+                            await heartbeat
+                        except asyncio.CancelledError:
+                            pass
                 
                 summary.results.append(result)
                 
@@ -245,6 +234,16 @@ class BackupManager:
                     skipped_count=summary.skipped_count,
                     failed_count=summary.failed_count,
                     status=status
+                )
+                
+                # 仅在仓库处理完成后保存进度，避免中断后漏掉当前仓库。
+                # current_index 存储“下一次应开始的 1-based 序号”，
+                # 兼容旧记录时用 saved_index - 1 恢复即可。
+                self.db.save_backup_progress(
+                    session_id=session_id,
+                    total_repos=summary.total_repos,
+                    current_index=i + 1,
+                    last_repo_full_name=repo.full_name
                 )
                 
                 # 只有真正执行了备份（成功上传）才等待 60 秒
@@ -387,10 +386,10 @@ class BackupManager:
         mirror_created = False  # 标记是否创建了本地镜像（仅上传模式使用）
         
         try:
-            # 1. 检查仓库是否还存在
-            exists = await self.github.check_repository_exists(repo.full_name)
+            # 1. 获取最新仓库信息，不存在则视为已删除
+            latest_info = await self.github.get_repository_info(repo.full_name)
             
-            if not exists:
+            if not latest_info:
                 logger.warning(f"仓库已删除: {repo.full_name}")
                 result.is_deleted = True
                 
@@ -403,13 +402,11 @@ class BackupManager:
                 result.success = True  # 删除检测成功
                 return result
             
-            # 2. 获取最新的仓库信息
-            latest_info = await self.github.get_repository_info(repo.full_name)
-            if latest_info:
-                repo.pushed_at = latest_info.pushed_at
-                repo.description = latest_info.description
-                repo.clone_url = latest_info.clone_url
-                self.db.save_repository(repo)
+            # 2. 更新数据库中的仓库信息
+            repo.pushed_at = latest_info.pushed_at
+            repo.description = latest_info.description
+            repo.clone_url = latest_info.clone_url
+            self.db.save_repository(repo)
             
             clone_url = repo.clone_url or f"https://github.com/{repo.full_name}.git"
             
@@ -610,7 +607,7 @@ class BackupManager:
             )
             
             if not cloud_path:
-                result.error_message = "上传到 WebDAV 失败"
+                result.error_message = self.webdav.last_error or "上传到 WebDAV 失败"
                 return result
             
             # 记录备份
@@ -874,7 +871,7 @@ class BackupManager:
                 logger.info(f"数据库备份成功: {cloud_path}")
                 return True
             else:
-                logger.error("数据库上传失败")
+                logger.error(f"数据库上传失败: {self.webdav.last_error or '未知错误'}")
                 return False
                 
         except Exception as e:
